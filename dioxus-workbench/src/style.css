@@ -1,0 +1,817 @@
+/* dioxus-workbench stylesheet.
+ *
+ * Every color, radius, and structural size flows through a `--wb-*` variable
+ * declared at zero specificity, so an application can retheme the whole kit
+ * by redefining variables on `.wb-shell` / `.wb-workspace` or any ancestor.
+ * Dark mode follows `prefers-color-scheme` out of the box. */
+
+:where(.wb-shell, .wb-workspace) {
+  --wb-canvas: #ffffff;
+  --wb-surface: #ffffff;
+  --wb-sunken: #f7f7f5;
+  --wb-viewport: #f5f5f3;
+  --wb-hover: rgb(55 53 47 / 0.06);
+  --wb-pressed: rgb(55 53 47 / 0.11);
+  --wb-line: #e8e8e6;
+  --wb-ink: #37352f;
+  --wb-ink-soft: #65645f;
+  --wb-ink-faint: #71706c;
+  --wb-accent: #0868b8;
+  --wb-selected: rgb(8 104 184 / 0.1);
+  --wb-good: #3a7654;
+  --wb-caution: #7d6a41;
+  --wb-danger: #be423d;
+  --wb-danger-soft: rgb(190 66 61 / 0.1);
+  --wb-shadow: 0 6px 18px rgb(0 0 0 / 0.08);
+  --wb-radius: 4px;
+  --wb-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+
+  --wb-tab-bar-size: 32px;
+  --wb-splitter-size: 8px;
+  --wb-rail-size: 3.75rem;
+  --wb-status-bar-size: 22px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :where(.wb-shell, .wb-workspace) {
+    --wb-canvas: #1f1f1e;
+    --wb-surface: #242423;
+    --wb-sunken: #1a1a19;
+    --wb-viewport: #1d1d1c;
+    --wb-hover: rgb(255 255 255 / 0.06);
+    --wb-pressed: rgb(255 255 255 / 0.11);
+    --wb-line: #3a3a37;
+    --wb-ink: #e6e5e2;
+    --wb-ink-soft: #a6a5a0;
+    --wb-ink-faint: #92918c;
+    --wb-accent: #4c9fe0;
+    --wb-selected: rgb(76 159 224 / 0.16);
+    --wb-good: #6cb28c;
+    --wb-caution: #c9a75f;
+    --wb-danger: #e07a75;
+    --wb-danger-soft: rgb(224 122 117 / 0.14);
+    --wb-shadow: 0 6px 18px rgb(0 0 0 / 0.4);
+  }
+}
+
+/* Shared chrome primitives ------------------------------------------------ */
+
+.wb-icon {
+  width: 0.875rem;
+  height: 0.875rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wb-icon-btn {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--wb-radius);
+  color: var(--wb-ink-soft);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  transition: color 100ms ease-out, background-color 100ms ease-out,
+    opacity 100ms ease-out;
+}
+
+.wb-icon-btn:hover {
+  color: var(--wb-ink);
+  background: var(--wb-hover);
+}
+
+.wb-icon-btn:active {
+  background: var(--wb-pressed);
+}
+
+.wb-icon-btn:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: 1px;
+}
+
+/* Secondary controls stay out of the way until the pointer or keyboard is in
+   their region. `:focus-within` keeps them visible for keyboard users. */
+.wb-hover-host:not(:hover):not(:focus-within) .wb-hover-action {
+  opacity: 0;
+}
+
+/* Panel workspace ---------------------------------------------------------- */
+
+.wb-workspace {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--wb-ink);
+  background: var(--wb-canvas);
+  font-family: var(--wb-font);
+  font-size: 12px;
+}
+
+.wb-workspace,
+.wb-workspace * {
+  box-sizing: border-box;
+}
+
+.wb-split {
+  display: flex;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wb-split-horizontal {
+  flex-direction: row;
+}
+
+.wb-split-vertical {
+  flex-direction: column;
+}
+
+.wb-split-child {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  transition: flex-basis 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.wb-split-first {
+  flex: 0 1 auto;
+}
+
+.wb-workspace[data-resizing="true"] .wb-split-child {
+  transition: none;
+}
+
+.wb-splitter {
+  position: relative;
+  z-index: 20;
+  flex: 0 0 var(--wb-splitter-size);
+  padding: 0;
+  border: none;
+  background: var(--wb-surface);
+}
+
+/* A wider invisible hit target than the drawn hairline. */
+.wb-splitter::before {
+  content: "";
+  position: absolute;
+}
+
+.wb-split-horizontal > .wb-splitter::before {
+  inset-block: 0;
+  inset-inline: -3px;
+}
+
+.wb-split-vertical > .wb-splitter::before {
+  inset-block: -3px;
+  inset-inline: 0;
+}
+
+.wb-split-horizontal > .wb-splitter {
+  cursor: col-resize;
+}
+
+.wb-split-vertical > .wb-splitter {
+  cursor: row-resize;
+}
+
+.wb-splitter::after {
+  content: "";
+  position: absolute;
+  background: var(--wb-line);
+  transition: background-color 100ms ease-out;
+}
+
+.wb-split-horizontal > .wb-splitter::after {
+  inset-block: 0;
+  left: calc(50% - 0.5px);
+  width: 1px;
+}
+
+.wb-split-vertical > .wb-splitter::after {
+  inset-inline: 0;
+  top: calc(50% - 0.5px);
+  height: 1px;
+}
+
+.wb-splitter:hover::after,
+.wb-splitter:focus-visible::after,
+.wb-splitter-active::after {
+  background: var(--wb-accent);
+}
+
+.wb-splitter:focus-visible {
+  outline: 1px solid var(--wb-accent);
+  outline-offset: -2px;
+}
+
+.wb-workspace[data-resizing="true"],
+.wb-workspace[data-resizing="true"] * {
+  user-select: none;
+}
+
+.wb-tile {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 10rem;
+  min-height: 5rem;
+  overflow: hidden;
+  background: var(--wb-surface);
+}
+
+.wb-tile-enter {
+  animation: wb-tile-enter 140ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes wb-tile-enter {
+  from {
+    clip-path: inset(0 8px 0 8px);
+    opacity: 0.72;
+  }
+  to {
+    clip-path: inset(0);
+    opacity: 1;
+  }
+}
+
+.wb-tab-bar {
+  position: relative;
+  z-index: 4;
+  display: flex;
+  min-height: var(--wb-tab-bar-size);
+  flex: 0 0 var(--wb-tab-bar-size);
+  align-items: stretch;
+  overflow: hidden;
+  border-bottom: 1px solid var(--wb-line);
+  background: var(--wb-sunken);
+}
+
+.wb-tabs {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.wb-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.wb-tab-item {
+  position: relative;
+  display: flex;
+  min-width: 5rem;
+  max-width: 14rem;
+  flex: 0 1 auto;
+  align-items: stretch;
+  border-right: 1px solid var(--wb-line);
+  background: transparent;
+  transition: background-color 100ms ease-out, border-color 100ms ease-out;
+}
+
+/* The separator earns its place only between two resting tabs. Drawn
+   unconditionally it leaves a hairline hanging off the end of the strip, and
+   it re-draws the edge of the active tab, which the lift from recess to paper
+   has already made. */
+.wb-tab-item:last-child,
+.wb-tab-item-active,
+.wb-tab-item:has(+ .wb-tab-item-active) {
+  border-right-color: transparent;
+}
+
+.wb-tab-item:hover:not(.wb-tab-item-active) {
+  background: var(--wb-hover);
+}
+
+.wb-tab {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  cursor: grab;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px;
+  border: none;
+  background: transparent;
+  color: var(--wb-ink-soft);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.wb-tab:active {
+  cursor: grabbing;
+}
+
+.wb-tab:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: -2px;
+}
+
+.wb-tab-item-active {
+  background: var(--wb-surface);
+}
+
+.wb-tab-item-active .wb-tab {
+  color: var(--wb-ink);
+  font-weight: 500;
+}
+
+.wb-tab-item-active::before {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--wb-accent);
+}
+
+.wb-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-tab-close {
+  min-width: 24px;
+  min-height: 24px;
+  flex: 0 0 24px;
+  align-self: center;
+}
+
+.wb-tab-close .wb-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.wb-empty-label {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  color: var(--wb-ink-faint);
+  font-size: 11px;
+}
+
+.wb-tile-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+  padding: 0 3px;
+  border-left: 1px solid var(--wb-line);
+  background: var(--wb-sunken);
+  transition: border-color 100ms ease-out;
+}
+
+/* The split controls fade in with the pointer, so the rule that fences them
+   off waits for them. On its own it is a hairline standing beside nothing,
+   once per panel group, on every screen. */
+.wb-tab-bar:not(:hover):not(:focus-within) .wb-tile-actions {
+  border-left-color: transparent;
+}
+
+.wb-tile-action .wb-icon {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.15;
+}
+
+.wb-panel-frame,
+.wb-panel-content {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.wb-panel-frame {
+  background: var(--wb-viewport);
+}
+
+.wb-panel-content > * {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.wb-panel-content[hidden] {
+  display: none;
+}
+
+.wb-empty-tile {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 16px;
+  color: var(--wb-ink-faint);
+  text-align: center;
+}
+
+.wb-empty-tile strong {
+  color: var(--wb-ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wb-empty-tile span {
+  max-width: 34ch;
+  font-size: 11px;
+}
+
+.wb-dock-overlay {
+  position: absolute;
+  z-index: 30;
+  inset: var(--wb-tab-bar-size) 0 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.wb-drop-zone {
+  position: absolute;
+  z-index: 3;
+  pointer-events: auto;
+}
+
+.wb-drop-zone-left {
+  inset: 0 72% 0 0;
+}
+.wb-drop-zone-right {
+  inset: 0 0 0 72%;
+}
+.wb-drop-zone-top {
+  inset: 0 28% 72%;
+}
+.wb-drop-zone-bottom {
+  inset: 72% 28% 0;
+}
+.wb-drop-zone-center {
+  inset: 28%;
+}
+
+.wb-drop-preview {
+  position: absolute;
+  z-index: 1;
+  border: 1px solid var(--wb-accent);
+  background: var(--wb-selected);
+  box-shadow: var(--wb-shadow);
+  animation: wb-dock-preview 120ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.wb-drop-preview-left {
+  inset: 4px 50% 4px 4px;
+}
+.wb-drop-preview-right {
+  inset: 4px 4px 4px 50%;
+}
+.wb-drop-preview-top {
+  inset: 4px 4px 50%;
+}
+.wb-drop-preview-bottom {
+  inset: 50% 4px 4px;
+}
+.wb-drop-preview-center {
+  inset: 4px;
+}
+
+@keyframes wb-dock-preview {
+  from {
+    clip-path: inset(10%);
+    opacity: 0.55;
+  }
+  to {
+    clip-path: inset(0);
+    opacity: 1;
+  }
+}
+
+.wb-drop-compass {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  transform: translate(-50%, -50%);
+  place-items: center;
+  border: 1px solid var(--wb-line);
+  border-radius: 6px;
+  color: var(--wb-accent);
+  background: var(--wb-surface);
+  box-shadow: var(--wb-shadow);
+}
+
+.wb-compass-icon {
+  width: 28px;
+  height: 28px;
+  fill: currentColor;
+  opacity: 0.85;
+}
+
+/* Workbench shell ---------------------------------------------------------- */
+
+.wb-shell {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--wb-ink);
+  background: var(--wb-canvas);
+  font-family: var(--wb-font);
+  font-size: 12px;
+}
+
+.wb-shell,
+.wb-shell * {
+  box-sizing: border-box;
+}
+
+.wb-shell-body {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.wb-main {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.wb-rail {
+  display: flex;
+  min-height: 0;
+  flex: 0 0 var(--wb-rail-size);
+  flex-direction: column;
+  overflow: hidden auto;
+  padding-block: 4px;
+  border-right: 1px solid var(--wb-line);
+  background: var(--wb-sunken);
+  scrollbar-width: none;
+}
+
+.wb-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.wb-rail-item {
+  position: relative;
+  display: flex;
+  min-height: 3.5rem;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding-inline: 2px;
+  border: none;
+  background: transparent;
+  color: var(--wb-ink-faint);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  text-align: center;
+  transition: color 100ms ease-out, background-color 100ms ease-out;
+}
+
+.wb-rail-item::before {
+  content: "";
+  position: absolute;
+  inset-block: 4px;
+  left: 0;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: transparent;
+}
+
+.wb-rail-item:hover {
+  color: var(--wb-ink);
+  background: var(--wb-hover);
+}
+
+.wb-rail-item:active {
+  background: var(--wb-pressed);
+}
+
+.wb-rail-item:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: -2px;
+}
+
+.wb-rail-item-active {
+  color: var(--wb-accent);
+  background: var(--wb-selected);
+  font-weight: 500;
+}
+
+.wb-rail-item-active::before {
+  background: var(--wb-accent);
+}
+
+/* The first bottom-pinned item absorbs the free space; the ones after it sit
+   flush below, because flexbox would otherwise share the space among every
+   auto margin and scatter them. */
+.wb-rail-item-bottom {
+  margin-top: auto;
+}
+
+.wb-rail-item-bottom ~ .wb-rail-item-bottom {
+  margin-top: 0;
+}
+
+.wb-rail-item .wb-rail-icon,
+.wb-rail-item svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wb-rail-item > span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Status bar ---------------------------------------------------------------
+   The left group carries context and the right group carries state, so when
+   the bar runs out of room the context is what gives way. */
+
+.wb-status-bar {
+  position: relative;
+  z-index: 40;
+  display: grid;
+  min-height: var(--wb-status-bar-size);
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 32rem) max-content;
+  column-gap: 0.75rem;
+  align-items: center;
+  padding-inline: 8px;
+  border-top: 1px solid var(--wb-line);
+  background: var(--wb-surface);
+  color: var(--wb-ink-soft);
+  font-family: var(--wb-font);
+  font-size: 10px;
+}
+
+.wb-status-group {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+}
+
+.wb-status-group-right {
+  grid-column: 3;
+  flex-shrink: 0;
+  justify-content: flex-end;
+}
+
+.wb-status-message {
+  grid-column: 2;
+  display: inline-flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+  padding-inline: 8px;
+  border-left: 1px solid var(--wb-line);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Space, not rules: facts fenced by hairlines turn a twenty-pixel bar into a
+   row of cells, and the bar's own top rule already divides what matters. */
+.wb-status-item {
+  display: inline-flex;
+  min-height: calc(var(--wb-status-bar-size) - 2px);
+  align-items: center;
+  gap: 4px;
+  padding-inline: 8px;
+  white-space: nowrap;
+}
+
+.wb-status-item:first-child {
+  padding-left: 0;
+}
+
+.wb-status-item:last-child {
+  padding-right: 0;
+}
+
+button.wb-status-item {
+  border: none;
+  border-radius: var(--wb-radius);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+button.wb-status-item:hover {
+  color: var(--wb-ink);
+  background: var(--wb-hover);
+}
+
+button.wb-status-item:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: -2px;
+}
+
+.wb-tone-accent {
+  color: var(--wb-accent);
+}
+
+.wb-tone-good {
+  color: var(--wb-good);
+}
+
+.wb-tone-caution {
+  color: var(--wb-caution);
+}
+
+.wb-tone-danger {
+  color: var(--wb-danger);
+}
+
+.wb-status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--wb-ink-faint);
+}
+
+.wb-status-dot.wb-tone-accent {
+  background: var(--wb-accent);
+}
+
+.wb-status-dot.wb-tone-good {
+  background: var(--wb-good);
+}
+
+.wb-status-dot.wb-tone-caution {
+  background: var(--wb-caution);
+}
+
+.wb-status-dot.wb-tone-danger {
+  background: var(--wb-danger);
+}
+
+/* Reduced motion ----------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-split-child,
+  .wb-splitter::after,
+  .wb-tab-item,
+  .wb-icon-btn,
+  .wb-rail-item {
+    transition: none;
+  }
+
+  .wb-tile-enter,
+  .wb-drop-preview {
+    animation: none;
+  }
+}
