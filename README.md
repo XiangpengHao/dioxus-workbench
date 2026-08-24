@@ -1,11 +1,14 @@
 # dioxus-workbench
 
+[![crates.io](https://img.shields.io/crates/v/dioxus-workbench.svg)](https://crates.io/crates/dioxus-workbench)
 [![CI](https://github.com/XiangpengHao/dioxus-workbench/actions/workflows/ci.yml/badge.svg)](https://github.com/XiangpengHao/dioxus-workbench/actions/workflows/ci.yml)
 
 A dockable panel workbench for [Dioxus](https://dioxuslabs.com): tabbed panel
 groups, drag-to-dock, resizable splits, an activity rail, and a status bar.
 
-![dioxus-workbench demo](assets/screenshot.png)
+<!-- Absolute URL on purpose: the published crate's readme is `../README.md`, so
+     crates.io resolves relative paths against `dioxus-workbench/`, not the repo root. -->
+![dioxus-workbench demo](https://raw.githubusercontent.com/XiangpengHao/dioxus-workbench/main/assets/screenshot.png)
 
 *The demo is a small fake IDE — three activities, each with its own persisted
 layout, plus a settings screen. Run it with `cd demo && dx serve`.*
