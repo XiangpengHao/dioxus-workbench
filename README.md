@@ -40,6 +40,9 @@ persisted layout. Run it with `cd demo && dx serve`.*
 
 ## Quickstart
 
+Two concepts get you a working workbench: panels, and the workspace that
+arranges them.
+
 ```rust
 use dioxus::prelude::*;
 use dioxus_workbench::prelude::*;
@@ -51,24 +54,38 @@ fn App() -> Element {
         Panel::new("editor", "Editor", "main", rsx! { Editor {} }),
         Panel::new("terminal", "Terminal", "bottom", rsx! { Terminal {} }),
     ];
-    let layout = PanelLayout::new(LayoutNode::split(
-        "root",
-        SplitAxis::Horizontal,
-        0.25,
-        LayoutNode::tile("side", ["files"]),
-        LayoutNode::split(
-            "main-rows",
-            SplitAxis::Vertical,
-            0.7,
-            LayoutNode::tile("main", ["editor"]),
-            LayoutNode::tile("bottom", ["terminal"]),
-        ),
-    ));
 
     rsx! {
         div { style: "width: 100vw; height: 100vh;",
-            PanelWorkspace { panels, initial_layout: layout }
+            PanelWorkspace { panels }
         }
+    }
+}
+```
+
+With no `initial_layout`, the workspace derives one from the panels' homes:
+one tile per distinct `home`, split left to right
+(`PanelLayout::from_homes`). When you outgrow that, describe the first-open
+tree yourself:
+
+```rust
+let layout = PanelLayout::new(LayoutNode::split(
+    "root",
+    SplitAxis::Horizontal,
+    0.25,
+    LayoutNode::tile("side", ["files"]),
+    LayoutNode::split(
+        "main-rows",
+        SplitAxis::Vertical,
+        0.7,
+        LayoutNode::tile("main", ["editor"]),
+        LayoutNode::tile("bottom", ["terminal"]),
+    ),
+));
+
+rsx! {
+    div { style: "width: 100vw; height: 100vh;",
+        PanelWorkspace { panels, initial_layout: layout }
     }
 }
 ```
@@ -147,6 +164,16 @@ missing panels are dropped, new panels join their `home` tile, and a panel
 built with `.with_home_zone(DockZone::Right)` splits in beside its home
 instead of hiding as another tab.
 
+When "it didn't decode" is not enough, `try_decode` and `try_encode` return a
+`LayoutError` naming the cause. `LayoutError::Version { found }` is the
+migration hook: the raw string is still yours, so translate an old format
+before decoding again instead of silently discarding every user's saved
+arrangement.
+
+`on_layout_change` fires once per settled mutation — a drop, a keyboard step,
+a finished splitter drag — never per pointer move, so persisting inside it
+(as above) is safe.
+
 The `layout_scope` prop reloads the layout when the host switches context
 (another document, another screen) while the component instance stays
 mounted. The demo persists one layout per activity this way.
@@ -157,7 +184,96 @@ The `panels` prop is the registry: render it from state and panels come and
 go at runtime. A panel built with `.with_closable(true)` gets a close
 affordance in its tab; handle `on_panel_close` by removing it from your
 registry. Set `active_panel` to bring a panel's tab to the front
-programmatically — a notification's "show me" action, for example.
+programmatically — a notification's "show me" action, for example. The
+request is edge-triggered with memory: it applies once when the value
+changes, and a standing `Some` never re-asserts itself when the registry
+changes or the user picks another tab (pass `None` in between to request the
+same panel twice).
+
+## Panel state
+
+Panel content stays mounted while tabs switch within a group — scroll
+positions, form values, and internal signals survive activation. A
+*structural* move is different: docking a panel into another group, or an
+edge split replacing a tile, rebuilds that region of the element tree and
+remounts the panels involved. State that must survive docking belongs
+outside the panel — a signal owned by the application, a context, or a store
+that the panel's content reads. The demo's Query panel keeps its text in a
+`GlobalSignal` for exactly this reason: drag its tab into another group and
+the edited text comes along.
+
+## Runtime control
+
+For a View menu, a command palette, or the reset command your users expect,
+hand the workspace an application-owned signal and mutate it with
+`PanelLayout`'s methods at any time — the same API the workspace itself uses:
+
+```rust
+let mut layout = use_signal(|| default_layout.clone());
+
+rsx! {
+    button {
+        onclick: move |_| {
+            // "Move the query panel in beside the records table."
+            layout.write().dock_panel(
+                &PanelId::from("query"),
+                &TileId::from("table"),
+                DockZone::Right,
+            );
+        },
+        "Query beside records"
+    }
+    button {
+        onclick: move |_| layout.set(default_layout.clone()), // reset command
+        "Reset layout"
+    }
+    PanelWorkspace { panels, layout }
+}
+```
+
+The signal must stay the same signal for the component's lifetime. The
+workspace writes its own mutations (drags, keyboard, tab clicks) to it and
+still reports them through `on_layout_change`; your own writes are not echoed
+back, since you already know about them.
+
+## Tab adornments and menus
+
+Tabs accept two application-owned slots — a leading icon and a trailing
+accessory (a dirty dot, an unread badge, a spinner):
+
+```rust
+Panel::new("editor", "main.rs", "main", rsx! { Editor {} })
+    .with_tab_icon(rsx! { RustFileIcon {} })
+    .with_tab_accessory(rsx! { span { class: "dirty-dot", "aria-label": "Unsaved changes" } })
+```
+
+`on_tab_menu` delivers context-menu gestures on tabs — panel, tile, and
+pointer position — and suppresses the native menu when provided. Drawing the
+menu stays your job; the demo's status line shows the hook firing:
+
+```rust
+PanelWorkspace {
+    panels,
+    on_tab_menu: move |request: TabMenuRequest| {
+        menu.set(Some((request.panel, request.x, request.y)));
+    },
+}
+```
+
+## Localization
+
+Every string the chrome draws itself — empty states, action labels,
+tooltips, accessible names — is overridable through `WorkbenchStrings`:
+
+```rust
+PanelWorkspace {
+    panels,
+    strings: WorkbenchStrings {
+        empty_tile_hint: "Déposez un onglet ici, ou fermez ce groupe.".into(),
+        ..Default::default()
+    },
+}
+```
 
 ## Theming
 
@@ -181,10 +297,10 @@ it yourself, it is exported as `dioxus_workbench::STYLESHEET`.
 
 | Prop | Fires when |
 | --- | --- |
-| `on_layout_change` | any layout mutation — docking, resizing, splitting, activating — with the full serializable layout |
+| `on_layout_change` | any settled layout mutation — a dock, a split, an activation, a finished resize — with the full serializable layout; never per pointer move |
 | `on_panel_activate` | a panel's tab comes to the front, by pointer, keyboard, drop, or `active_panel` |
 | `on_panel_close` | a closable panel's close affordance is used; remove the panel from `panels` to complete it |
-| `on_resize` | panel geometry changed, for content that measures its container (canvases, charts) |
+| `on_resize` | panel geometry settled, for content that measures its container (canvases, charts) |
 
 ## Development
 
@@ -206,6 +322,7 @@ newer than the one dx pins and crashes on the debug info dx keeps by default:
 ## Roadmap
 
 - Floating panels and maximize-a-group
-- Layout presets and a "reset layout" command
 - Tab overflow menus for very crowded groups
 - Optional tab reordering within a group
+- Replaceable chrome icons and a per-group toolbar slot
+- Preserving panel state across structural docks (see "Panel state")

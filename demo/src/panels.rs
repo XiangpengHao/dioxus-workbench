@@ -202,13 +202,23 @@ pub fn Chart() -> Element {
     }
 }
 
+/// Lifted outside the component on purpose: docking a panel into another
+/// group remounts its content, so state that must survive a dock lives
+/// outside the panel and the panel reads it (see README "Panel state").
+/// Drag the Query tab somewhere else — the edited text comes along.
+static QUERY_TEXT: GlobalSignal<String> = Signal::global(|| {
+    "SELECT task, count(*) AS episodes\nFROM records\nGROUP BY task\nORDER BY episodes DESC;"
+        .to_owned()
+});
+
 #[component]
 pub fn Query() -> Element {
     rsx! {
         div { class: "demo-pane demo-query",
             textarea {
                 spellcheck: false,
-                initial_value: "SELECT task, count(*) AS episodes\nFROM records\nGROUP BY task\nORDER BY episodes DESC;",
+                value: "{QUERY_TEXT}",
+                oninput: move |event| *QUERY_TEXT.write() = event.value(),
             }
         }
     }

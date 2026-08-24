@@ -35,6 +35,55 @@ pub(crate) fn capture_pointer(element_id: &str, pointer_id: i32) {
     });
 }
 
+/// Write a split child's flex-basis directly while a splitter drag is live,
+/// bypassing the VDOM: committing the layout per pointer move would re-render
+/// the whole workspace at pointer frequency. The settled ratio is committed
+/// (and rendered normally) when the gesture ends.
+pub(crate) fn set_flex_basis(element_id: &str, percent: f64) {
+    let script = format!(
+        "const el = document.getElementById({id}); if (el) el.style.flexBasis = '{percent:.5}%';",
+        id = js_string(element_id),
+    );
+    dioxus::dioxus_core::spawn_forever(async move {
+        let _ = document::eval(&script).await;
+    });
+}
+
+/// Scroll an element horizontally by a pixel delta — the wheel-over-tab-strip
+/// affordance editors train: a vertical wheel walks an overflowed strip
+/// sideways. A no-op when nothing overflows.
+pub(crate) fn scroll_by_x(element_id: &str, delta: f64) {
+    if !delta.is_finite() || delta == 0.0 {
+        return;
+    }
+    let script = format!(
+        "const el = document.getElementById({id}); if (el) el.scrollLeft += {delta:.2};",
+        id = js_string(element_id),
+    );
+    dioxus::dioxus_core::spawn_forever(async move {
+        let _ = document::eval(&script).await;
+    });
+}
+
+/// Bring an element into view inside its scrollable ancestor — an activated
+/// tab in a crowded, overflowed strip. `nearest` keeps it from scrolling the
+/// page itself.
+pub(crate) fn scroll_into_view(element_id: &str) {
+    let script = format!(
+        "const el = document.getElementById({id}); \
+         if (el && el.scrollIntoView) el.scrollIntoView({{block: 'nearest', inline: 'nearest'}});",
+        id = js_string(element_id),
+    );
+    dioxus::dioxus_core::spawn_forever(async move {
+        // Yield a tick first: this runs from effect flushes (including the
+        // very first mount), and evaluating script from that context can
+        // re-enter the executor mid-poll — the same deferral
+        // `focus_after_render` uses.
+        sleep_ms(0).await;
+        let _ = document::eval(&script).await;
+    });
+}
+
 /// Move focus after Dioxus has committed a replacement subtree. Retries for a
 /// few frames because the target may not exist until the next render.
 pub fn focus_after_render(id: impl Into<String>) {

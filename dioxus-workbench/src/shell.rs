@@ -7,7 +7,7 @@
 
 use dioxus::prelude::*;
 
-use crate::style::{use_style_owner, STYLE};
+use crate::style::{use_style_owner, WorkbenchStyle};
 
 /// The application frame: an optional [`ActivityRail`] on the left, the main
 /// region in the middle, and an optional [`StatusBar`] along the bottom that
@@ -28,7 +28,7 @@ pub fn Workbench(
     let owns_style = use_style_owner();
     rsx! {
         if owns_style {
-            document::Style { {STYLE} }
+            WorkbenchStyle {}
         }
         div { class: "wb-shell",
             div { class: "wb-shell-body",
@@ -82,7 +82,9 @@ pub fn ActivityButton(
             r#type: "button",
             id,
             class,
-            "aria-pressed": active,
+            // A rail is a single-select set of destinations, not independent
+            // toggles; `aria-current` says "you are here".
+            "aria-current": if active { "true" },
             title,
             onclick: move |event| onclick.call(event),
             if let Some(icon) = icon {

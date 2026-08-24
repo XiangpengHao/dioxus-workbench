@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 dioxus = { workspace = true, features = ["launch", "devtools", "logger"] }
 dioxus-workbench = { workspace = true }
+gloo-timers = { version = "0.3", features = ["futures"] }
 # Pinned to the wasm-bindgen-cli version wrapped by the nixpkgs dioxus-cli
 # (`dx` requires the crate and CLI versions to match exactly).
 wasm-bindgen = "=0.2.126"

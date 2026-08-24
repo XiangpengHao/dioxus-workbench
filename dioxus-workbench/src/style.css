@@ -278,6 +278,58 @@
   display: none;
 }
 
+/* Overflow cue: the strip fades at an edge exactly while more tabs lie
+   beyond it, and activation scrolls the active tab into view. Scroll-driven,
+   so it needs no measurement; browsers without scroll timelines simply show
+   no fade. Not motion — the mask tracks scroll state, so reduced-motion does
+   not apply. */
+@property --wb-tabs-fade-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --wb-tabs-fade-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@supports (animation-timeline: scroll(self inline)) {
+  .wb-tabs {
+    animation-name: wb-tabs-fade-start, wb-tabs-fade-end;
+    animation-duration: auto, auto; /* progress comes from the timeline */
+    animation-fill-mode: both, both;
+    animation-timeline: scroll(self inline), scroll(self inline);
+    animation-range: 0px 18px, calc(100% - 18px) 100%;
+    mask-image: linear-gradient(
+      to right,
+      transparent 0,
+      #000 var(--wb-tabs-fade-start),
+      #000 calc(100% - var(--wb-tabs-fade-end)),
+      transparent 100%
+    );
+  }
+
+  @keyframes wb-tabs-fade-start {
+    from {
+      --wb-tabs-fade-start: 0px;
+    }
+    to {
+      --wb-tabs-fade-start: 14px;
+    }
+  }
+
+  @keyframes wb-tabs-fade-end {
+    from {
+      --wb-tabs-fade-end: 14px;
+    }
+    to {
+      --wb-tabs-fade-end: 0px;
+    }
+  }
+}
+
 .wb-tab-item {
   position: relative;
   display: flex;
@@ -353,6 +405,22 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Application-owned tab adornments: a leading icon, a trailing dirty dot or
+   badge. Containers only — their content and meaning stay the application's.
+   They refuse to shrink, so the label is what gives way in a tight tab. */
+.wb-tab-icon,
+.wb-tab-accessory {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.wb-tab-icon svg,
+.wb-tab-accessory svg {
+  width: 0.875rem;
+  height: 0.875rem;
 }
 
 .wb-tab-close {
@@ -445,6 +513,13 @@
 .wb-empty-tile span {
   max-width: 34ch;
   font-size: 11px;
+}
+
+/* The one place the keyboard vocabulary is readable without a pointer. */
+.wb-empty-keys {
+  margin-top: 5px;
+  color: var(--wb-ink-faint);
+  opacity: 0.9;
 }
 
 .wb-dock-overlay {
@@ -605,7 +680,7 @@
   color: var(--wb-ink-faint);
   cursor: pointer;
   font: inherit;
-  font-size: 10px;
+  font-size: 11px;
   text-align: center;
   transition: color 100ms ease-out, background-color 100ms ease-out;
 }
@@ -692,7 +767,7 @@
   background: var(--wb-surface);
   color: var(--wb-ink-soft);
   font-family: var(--wb-font);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .wb-status-group {
@@ -805,6 +880,7 @@ button.wb-status-item:focus-visible {
   .wb-split-child,
   .wb-splitter::after,
   .wb-tab-item,
+  .wb-tile-actions,
   .wb-icon-btn,
   .wb-rail-item {
     transition: none;

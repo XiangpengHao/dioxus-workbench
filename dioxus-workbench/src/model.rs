@@ -114,6 +114,42 @@ pub enum SplitAxis {
     Vertical,
 }
 
+/// Why a persisted or hand-built layout was rejected.
+///
+/// Returned by [`PanelLayout::try_encode`], [`PanelLayout::try_decode`], and
+/// [`PanelLayout::validate`]. The `Option`-returning `encode`/`decode` remain
+/// for callers that only care about the happy path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LayoutError {
+    /// The persisted value is not a layout at all — malformed JSON or the
+    /// wrong shape.
+    Malformed,
+    /// The value was written by a different format version. This is the
+    /// migration hook: the raw string is still yours, so translate it and
+    /// decode again — or fall back to the default arrangement.
+    Version { found: u8 },
+    /// The tree violates an invariant; the message names the first violation
+    /// found (duplicate ids, an active tab the tile does not contain, an
+    /// out-of-range ratio).
+    Invalid(String),
+}
+
+impl std::fmt::Display for LayoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => write!(formatter, "not a panel layout"),
+            Self::Version { found } => write!(
+                formatter,
+                "layout format version {found} (this crate reads version {LAYOUT_VERSION})"
+            ),
+            Self::Invalid(reason) => write!(formatter, "invalid layout: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for LayoutError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DockZone {
     Center,
@@ -262,19 +298,80 @@ impl PanelLayout {
         Self::new(LayoutNode::tile(tile, [panel.into()]))
     }
 
+    /// A first-open arrangement derived from panel homes alone: one tile per
+    /// distinct `home`, in first-registration order, split left to right in
+    /// equal shares, with each panel attached through the same reconciliation
+    /// that places late arrivals (so `with_home_zone` hints apply).
+    ///
+    /// [`PanelWorkspace`](crate::PanelWorkspace) uses this when no
+    /// `initial_layout` is given; it also makes a sensible `reset_layout` for
+    /// applications that never hand-author a tree.
+    pub fn from_homes(placements: &[PanelPlacement]) -> Self {
+        let mut homes = Vec::<TileId>::new();
+        for placement in placements {
+            if !homes.contains(&placement.home) {
+                homes.push(placement.home.clone());
+            }
+        }
+        let mut layout = match homes.split_last() {
+            None => Self::new(LayoutNode::empty_tile("wb-home")),
+            Some((last, rest)) => {
+                let mut node = LayoutNode::tile(last.clone(), std::iter::empty::<PanelId>());
+                let total = homes.len();
+                for (index, home) in rest.iter().enumerate().rev() {
+                    node = LayoutNode::split(
+                        format!("wb-home-split-{}", index + 1),
+                        SplitAxis::Horizontal,
+                        1.0 / (total - index) as f64,
+                        LayoutNode::tile(home.clone(), std::iter::empty::<PanelId>()),
+                        node,
+                    );
+                }
+                Self::new(node)
+            }
+        };
+        layout.reconcile(placements);
+        layout
+    }
+
     pub fn encode(&self) -> Option<String> {
-        self.valid()
-            .then(|| serde_json::to_string(self).ok())
-            .flatten()
+        self.try_encode().ok()
+    }
+
+    /// Encode for persistence, or say precisely why the tree cannot be
+    /// persisted. Layouts mutated only through this type's methods always
+    /// encode; [`LayoutError::Invalid`] appears when a tree was assembled
+    /// directly through the public node fields and broke an invariant.
+    pub fn try_encode(&self) -> Result<String, LayoutError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|_| LayoutError::Malformed)
     }
 
     pub fn decode(value: &str) -> Option<Self> {
-        serde_json::from_str::<Self>(value).ok().filter(Self::valid)
+        Self::try_decode(value).ok()
+    }
+
+    /// Decode a persisted layout, distinguishing corruption from version
+    /// drift. [`LayoutError::Version`] carries the version that wrote the
+    /// value, so an application can migrate the raw string instead of
+    /// silently discarding every saved arrangement.
+    pub fn try_decode(value: &str) -> Result<Self, LayoutError> {
+        let layout = serde_json::from_str::<Self>(value).map_err(|_| LayoutError::Malformed)?;
+        layout.validate()?;
+        Ok(layout)
     }
 
     pub fn valid(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    /// Check every invariant: format version, unique tile/split/panel ids,
+    /// active tabs that exist, and finite in-range ratios.
+    pub fn validate(&self) -> Result<(), LayoutError> {
         if self.version != LAYOUT_VERSION {
-            return false;
+            return Err(LayoutError::Version {
+                found: self.version,
+            });
         }
         let mut tiles = HashSet::new();
         let mut splits = HashSet::new();
@@ -354,6 +451,13 @@ impl PanelLayout {
 
     pub fn tile_count(&self) -> usize {
         tile_ids(&self.root).len()
+    }
+
+    /// Every split id in the tree, in first-child order.
+    pub fn split_ids(&self) -> Vec<SplitId> {
+        let mut ids = Vec::new();
+        collect_split_ids(&self.root, &mut ids);
+        ids
     }
 
     pub fn split_ratio(&self, id: &SplitId) -> Option<f64> {
@@ -506,15 +610,35 @@ fn validate_node(
     tiles: &mut HashSet<TileId>,
     splits: &mut HashSet<SplitId>,
     panels: &mut HashSet<PanelId>,
-) -> bool {
+) -> Result<(), LayoutError> {
     match node {
         LayoutNode::Tile(tile) => {
-            tiles.insert(tile.id.clone())
-                && tile.panels.iter().all(|panel| panels.insert(panel.clone()))
-                && match &tile.active {
-                    Some(active) => tile.panels.contains(active),
-                    None => tile.panels.is_empty(),
+            if !tiles.insert(tile.id.clone()) {
+                return Err(LayoutError::Invalid(format!(
+                    "duplicate tile id `{}`",
+                    tile.id
+                )));
+            }
+            for panel in &tile.panels {
+                if !panels.insert(panel.clone()) {
+                    return Err(LayoutError::Invalid(format!(
+                        "panel `{panel}` appears in more than one tile"
+                    )));
                 }
+            }
+            match &tile.active {
+                Some(active) if !tile.panels.contains(active) => {
+                    Err(LayoutError::Invalid(format!(
+                        "tile `{}` activates `{active}`, which it does not contain",
+                        tile.id
+                    )))
+                }
+                None if !tile.panels.is_empty() => Err(LayoutError::Invalid(format!(
+                    "tile `{}` holds panels but activates none of them",
+                    tile.id
+                ))),
+                _ => Ok(()),
+            }
         }
         LayoutNode::Split {
             id,
@@ -523,11 +647,16 @@ fn validate_node(
             second,
             ..
         } => {
-            splits.insert(id.clone())
-                && ratio.is_finite()
-                && (MIN_SPLIT_RATIO..=MAX_SPLIT_RATIO).contains(ratio)
-                && validate_node(first, tiles, splits, panels)
-                && validate_node(second, tiles, splits, panels)
+            if !splits.insert(id.clone()) {
+                return Err(LayoutError::Invalid(format!("duplicate split id `{id}`")));
+            }
+            if !ratio.is_finite() || !(MIN_SPLIT_RATIO..=MAX_SPLIT_RATIO).contains(ratio) {
+                return Err(LayoutError::Invalid(format!(
+                    "split `{id}` ratio {ratio} is outside {MIN_SPLIT_RATIO}..={MAX_SPLIT_RATIO}"
+                )));
+            }
+            validate_node(first, tiles, splits, panels)?;
+            validate_node(second, tiles, splits, panels)
         }
     }
 }
@@ -549,7 +678,17 @@ fn reconcile_node(
                 tile.active = tile.panels.first().cloned();
             }
         }
-        LayoutNode::Split { first, second, .. } => {
+        LayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            // Trees assembled directly through the public node fields can
+            // carry ratios the constructors would have clamped. Heal them at
+            // the boundary instead of rendering a degenerate pane and then
+            // refusing to persist it.
+            *ratio = clamp_ratio(*ratio);
             reconcile_node(first, available, seen);
             reconcile_node(second, available, seen);
         }
@@ -791,6 +930,19 @@ fn collect_tile_ids(node: &LayoutNode, ids: &mut Vec<TileId>) {
     }
 }
 
+fn collect_split_ids(node: &LayoutNode, ids: &mut Vec<SplitId>) {
+    match node {
+        LayoutNode::Tile(_) => {}
+        LayoutNode::Split {
+            id, first, second, ..
+        } => {
+            ids.push(id.clone());
+            collect_split_ids(first, ids);
+            collect_split_ids(second, ids);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,6 +1122,92 @@ mod tests {
         assert_eq!(PanelLayout::decode(&encoded), Some(layout));
         assert!(PanelLayout::decode(&encoded.replace("\"version\":1", "\"version\":2")).is_none());
         assert!(PanelLayout::decode(&encoded.replace("0.6", "1.4")).is_none());
+    }
+
+    #[test]
+    fn from_homes_builds_one_tile_per_distinct_home_in_registration_order() {
+        let layout = PanelLayout::from_homes(&[
+            PanelPlacement::new("files", "side"),
+            PanelPlacement::new("editor", "main"),
+            PanelPlacement::new("readme", "main"),
+            PanelPlacement::new("terminal", "bottom"),
+        ]);
+        assert_eq!(layout.tile_count(), 3);
+        assert_eq!(tile_ids(&layout.root)[0], TileId::from("side"));
+        assert_eq!(
+            layout.tile(&TileId::from("main")).unwrap().panels,
+            vec![PanelId::from("editor"), PanelId::from("readme")]
+        );
+        assert!(layout.valid());
+        assert!(layout.encode().is_some());
+    }
+
+    #[test]
+    fn from_homes_honors_home_zone_hints_and_survives_emptiness() {
+        let layout = PanelLayout::from_homes(&[
+            PanelPlacement::new("editor", "main"),
+            PanelPlacement::new("preview", "main").with_zone(DockZone::Right),
+        ]);
+        assert_ne!(
+            layout.tile_for_panel(&PanelId::from("editor")),
+            layout.tile_for_panel(&PanelId::from("preview"))
+        );
+        assert!(layout.valid());
+
+        let empty = PanelLayout::from_homes(&[]);
+        assert_eq!(empty.tile_count(), 1);
+        assert!(empty.valid());
+    }
+
+    #[test]
+    fn decode_errors_name_their_cause() {
+        let encoded = two_tiles().encode().unwrap();
+        assert_eq!(
+            PanelLayout::try_decode(&encoded.replace("\"version\":1", "\"version\":2")),
+            Err(LayoutError::Version { found: 2 })
+        );
+        assert_eq!(
+            PanelLayout::try_decode("not a layout"),
+            Err(LayoutError::Malformed)
+        );
+        assert!(matches!(
+            PanelLayout::try_decode(&encoded.replace("0.6", "1.4")),
+            Err(LayoutError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn hand_built_invariant_violations_fail_encoding_with_a_reason() {
+        let layout = PanelLayout::new(LayoutNode::Split {
+            id: SplitId::from("root"),
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::tile("same", ["editor"])),
+            second: Box::new(LayoutNode::tile("same", ["terminal"])),
+        });
+        let error = layout.try_encode().unwrap_err();
+        assert!(matches!(&error, LayoutError::Invalid(reason) if reason.contains("same")));
+    }
+
+    #[test]
+    fn reconcile_heals_out_of_range_ratios_from_public_construction() {
+        let mut layout = PanelLayout::new(LayoutNode::Split {
+            id: SplitId::from("root"),
+            axis: SplitAxis::Horizontal,
+            ratio: 5.0,
+            first: Box::new(LayoutNode::tile("left", ["editor"])),
+            second: Box::new(LayoutNode::tile("right", ["terminal"])),
+        });
+        assert!(!layout.valid());
+        layout.reconcile(&[
+            PanelPlacement::new("editor", "left"),
+            PanelPlacement::new("terminal", "right"),
+        ]);
+        assert_eq!(
+            layout.split_ratio(&SplitId::from("root")),
+            Some(MAX_SPLIT_RATIO)
+        );
+        assert!(layout.valid());
     }
 
     #[test]

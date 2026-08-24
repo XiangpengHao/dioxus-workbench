@@ -24,3 +24,14 @@ pub(crate) fn use_style_owner() -> bool {
     use_context_provider(|| StyleInstalled);
     !inherited
 }
+
+/// The stylesheet element, isolated in a component with no props so it never
+/// re-renders after mount. Rendering `document::Style` inline in a component
+/// that re-renders would diff the style element's props on every pass, which
+/// `document::Style` does not support and warns about.
+#[component]
+pub(crate) fn WorkbenchStyle() -> Element {
+    rsx! {
+        document::Style { {STYLE} }
+    }
+}

@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
 use crate::dom;
 use crate::icons::{CloseIcon, DockCompassIcon, SplitDownIcon, SplitRightIcon};
 use crate::model::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO};
-use crate::style::{use_style_owner, STYLE};
+use crate::strings::WorkbenchStrings;
+use crate::style::{use_style_owner, WorkbenchStyle};
 use crate::{
     DockZone, LayoutNode, PanelId, PanelLayout, PanelPlacement, SplitAxis, SplitId, Tile, TileId,
 };
@@ -24,6 +26,22 @@ pub struct Panel {
     pub class: String,
     pub closable: bool,
     pub content: Element,
+    pub tab_icon: Option<Element>,
+    pub tab_accessory: Option<Element>,
+}
+
+/// A context-menu request on a panel tab, delivered through
+/// [`PanelWorkspace`]'s `on_tab_menu`. The library never draws a menu — what
+/// a tab's menu says is application territory; this carries where and about
+/// what.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabMenuRequest {
+    pub panel: PanelId,
+    /// The tile the panel currently sits in.
+    pub tile: TileId,
+    /// Pointer position in client coordinates, for menu placement.
+    pub x: f64,
+    pub y: f64,
 }
 
 impl Panel {
@@ -41,6 +59,8 @@ impl Panel {
             class: String::new(),
             closable: false,
             content,
+            tab_icon: None,
+            tab_accessory: None,
         }
     }
 
@@ -65,6 +85,22 @@ impl Panel {
         self
     }
 
+    /// A small element rendered before the tab's label — typically a file or
+    /// content icon. Decorative: it is hidden from assistive technology, so
+    /// the label must carry the meaning.
+    pub fn with_tab_icon(mut self, icon: Element) -> Self {
+        self.tab_icon = Some(icon);
+        self
+    }
+
+    /// A small element rendered after the tab's label — a dirty dot, an
+    /// unread badge, a spinner. The application owns its meaning and, when it
+    /// carries one, its accessible name.
+    pub fn with_tab_accessory(mut self, accessory: Element) -> Self {
+        self.tab_accessory = Some(accessory);
+        self
+    }
+
     fn placement(&self) -> PanelPlacement {
         PanelPlacement::new(self.id.clone(), self.home.clone()).with_zone(self.home_zone)
     }
@@ -83,15 +119,23 @@ struct ResizeDrag {
     pointer_origin: f64,
     start_ratio: f64,
     span: f64,
+    /// DOM id of the split's first child, the element whose flex-basis the
+    /// drag writes directly while the gesture is live.
+    first_child_dom: String,
 }
 
-#[derive(Clone, PartialEq)]
-struct RenderContext {
-    panels: Vec<Panel>,
-    placements: Vec<PanelPlacement>,
+/// Copyable handles shared by every node of one workspace tree.
+///
+/// Provided through context rather than cloned down the recursion: signals
+/// and event handlers are `Copy`, so subscribing components pay only for what
+/// they actually read. Render code must not read `placements` or
+/// `reset_layout` — they exist for event handlers, which `peek` them.
+#[derive(Clone, Copy)]
+struct WorkspaceShared {
     layout: Signal<PanelLayout>,
-    reset_layout: PanelLayout,
-    display_tile_count: usize,
+    placements: Signal<Vec<PanelPlacement>>,
+    reset_layout: Signal<PanelLayout>,
+    strings: Signal<WorkbenchStrings>,
     dragging: Signal<Option<PanelId>>,
     drop_preview: Signal<Option<DropPreview>>,
     resizing: Signal<Option<ResizeDrag>>,
@@ -100,6 +144,7 @@ struct RenderContext {
     on_panel_activate: EventHandler<PanelId>,
     on_panel_close: EventHandler<PanelId>,
     on_resize: EventHandler<()>,
+    on_tab_menu: Option<EventHandler<TabMenuRequest>>,
 }
 
 /// Render a session-owned tree of tabbed panels and resizable splits.
@@ -116,8 +161,21 @@ pub fn PanelWorkspace(
     /// disappear from the layout on the next render.
     panels: Vec<Panel>,
     /// The layout to open with — the canonical arrangement, or a restored
-    /// session (see [`PanelLayout::decode`]).
-    initial_layout: PanelLayout,
+    /// session (see [`PanelLayout::decode`]). When omitted, an arrangement is
+    /// derived from panel homes: one tile per distinct `home`, split left to
+    /// right ([`PanelLayout::from_homes`]).
+    #[props(default)]
+    initial_layout: Option<PanelLayout>,
+    /// Controlled mode: an application-owned signal as the source of truth.
+    /// Mutate it at any time with [`PanelLayout`]'s methods — `dock_panel`,
+    /// `split_active`, `activate` — to drive the layout programmatically (a
+    /// View menu, a reset command). The workspace writes its own mutations to
+    /// the same signal and still reports them through `on_layout_change`;
+    /// writes the application makes itself are not echoed back. Must remain
+    /// the same signal for the component's lifetime. Without it, the
+    /// workspace owns layout state internally, seeded from `initial_layout`.
+    #[props(default)]
+    layout: Option<Signal<PanelLayout>>,
     /// The target of a double-click reset on a splitter. Defaults to
     /// `initial_layout`; pass the canonical arrangement when
     /// `initial_layout` carries a restored session, so reset means "as
@@ -133,10 +191,19 @@ pub fn PanelWorkspace(
     layout_scope: Option<String>,
     /// Programmatic activation: setting this brings a registered panel's tab
     /// to the front through the same path as a click.
+    ///
+    /// Edge-triggered with memory: the workspace acts when the value changes
+    /// to a panel it has not yet applied, then leaves tab state alone — a
+    /// standing `Some` never re-asserts itself when the registry changes or
+    /// the user picks another tab. To request the same panel twice in a row,
+    /// pass `None` in between. A request naming a panel that is not yet
+    /// registered stays pending until that panel arrives.
     #[props(default)]
     active_panel: Option<PanelId>,
-    /// Fired after every layout mutation with the full serializable layout —
-    /// the hook for persistence (see [`PanelLayout::encode`]).
+    /// Fired after every settled layout mutation — docking, splitting, tab
+    /// activation, a finished resize — with the full serializable layout: the
+    /// hook for persistence (see [`PanelLayout::encode`]). Not fired for every
+    /// pointer move while a splitter drag is still in flight.
     #[props(default)]
     on_layout_change: EventHandler<PanelLayout>,
     #[props(default)] on_panel_activate: EventHandler<PanelId>,
@@ -144,22 +211,97 @@ pub fn PanelWorkspace(
     /// application removes the panel from `panels` to complete the close.
     #[props(default)]
     on_panel_close: EventHandler<PanelId>,
-    /// Fired when panel geometry changes (splits resized, tabs docked), for
+    /// Fired when panel geometry settles (a dock, a finished resize), for
     /// content that measures its container, such as canvases.
     #[props(default)]
     on_resize: EventHandler<()>,
+    /// Fired on a context-menu gesture (right-click, menu key) on a tab.
+    /// Providing this suppresses the native browser menu on tabs; the
+    /// application draws its own from the request's panel, tile, and
+    /// position. Absent, tabs keep the native menu.
+    #[props(default)]
+    on_tab_menu: Option<EventHandler<TabMenuRequest>>,
+    /// Overrides for the chrome's own text — see [`WorkbenchStrings`].
+    #[props(default)]
+    strings: Option<WorkbenchStrings>,
 ) -> Element {
     let owns_style = use_style_owner();
     let placements = panels.iter().map(Panel::placement).collect::<Vec<_>>();
+    // With no explicit first arrangement, derive one from panel homes.
+    let resolved_initial = initial_layout.unwrap_or_else(|| PanelLayout::from_homes(&placements));
     let initial_placements = placements.clone();
-    let initial_fallback = initial_layout.clone();
-    let mut layout = use_signal(move || layout_for_registry(initial_fallback, &initial_placements));
+    let initial_fallback = resolved_initial.clone();
+    let internal_layout =
+        use_signal(move || layout_for_registry(initial_fallback, &initial_placements));
+    // Controlled mode: the application's signal is the source of truth. It
+    // must remain the same signal for the component's lifetime.
+    let mut layout = layout.unwrap_or(internal_layout);
     let initial_scope = layout_scope.clone();
     let mut current_layout_scope = use_signal(move || initial_scope);
     let mut dragging = use_signal(|| None::<PanelId>);
     let mut drop_preview = use_signal(|| None::<DropPreview>);
     let mut resizing = use_signal(|| None::<ResizeDrag>);
     let split_mounts = use_signal(HashMap::<SplitId, Rc<MountedData>>::new);
+    let resolved_reset = reset_layout.unwrap_or_else(|| resolved_initial.clone());
+    let resolved_strings = strings.unwrap_or_default();
+    let placements_mirror = use_signal({
+        let initial = placements.clone();
+        move || initial
+    });
+    let reset_mirror = use_signal({
+        let initial = resolved_reset.clone();
+        move || initial
+    });
+    let strings_mirror = use_signal({
+        let initial = resolved_strings.clone();
+        move || initial
+    });
+
+    let shared = use_context_provider(|| WorkspaceShared {
+        layout,
+        placements: placements_mirror,
+        reset_layout: reset_mirror,
+        strings: strings_mirror,
+        dragging,
+        drop_preview,
+        resizing,
+        split_mounts,
+        on_layout_change,
+        on_panel_activate,
+        on_panel_close,
+        on_resize,
+        on_tab_menu,
+    });
+
+    // Registrations that cannot render are repaired silently; say so once at
+    // mount, and again whenever the registry changes into a bad state.
+    {
+        let mount_placements = placements.clone();
+        use_hook(move || warn_duplicate_panels(&mount_placements));
+    }
+
+    // Event handlers read the registry through these mirrors, so they must
+    // follow the props on every render. Only the strings mirror has render
+    // subscribers, and it changes about never.
+    let sync_placements = placements.clone();
+    use_effect(use_reactive(
+        (&sync_placements, &resolved_reset, &resolved_strings),
+        move |(placements, reset, strings)| {
+            let mut placements_mirror = placements_mirror;
+            let mut reset_mirror = reset_mirror;
+            let mut strings_mirror = strings_mirror;
+            if *placements_mirror.peek() != placements {
+                warn_duplicate_panels(&placements);
+                placements_mirror.set(placements);
+            }
+            if *reset_mirror.peek() != reset {
+                reset_mirror.set(reset);
+            }
+            if *strings_mirror.peek() != strings {
+                strings_mirror.set(strings);
+            }
+        },
+    ));
 
     use_effect(dom::install_drag_shim);
 
@@ -168,7 +310,7 @@ pub fn PanelWorkspace(
     // rendering hint, not an ownership boundary, so explicitly reload the
     // session layout for the new scope.
     let scope_dependency = layout_scope.clone();
-    let next_fallback = initial_layout.clone();
+    let next_fallback = resolved_initial.clone();
     let next_placements = placements.clone();
     use_effect(use_reactive((&scope_dependency,), move |(next_scope,)| {
         if current_layout_scope.peek().as_ref() == next_scope.as_ref() {
@@ -184,272 +326,350 @@ pub fn PanelWorkspace(
 
     // Consumers such as run histories can open a registered panel directly.
     // Keep the workspace as the owner of tab state so pointer, keyboard, and
-    // programmatic activation all converge on the same session layout.
+    // programmatic activation all converge on the same session layout. The
+    // request is an edge, not a level: remembering what was last applied
+    // keeps an unrelated registry change from yanking the user's tab
+    // selection back to a stale `Some`.
+    let mut applied_active = use_signal(|| None::<PanelId>);
     let requested_panel = active_panel.clone();
     let requested_registry = placements.clone();
-    let requested_layout_change = on_layout_change;
-    let requested_resize = on_resize;
     use_effect(use_reactive(
         (&requested_panel, &requested_registry),
         move |(requested_panel, requested_registry)| {
-            let Some(panel) = requested_panel else { return };
+            let Some(panel) = requested_panel else {
+                applied_active.set(None);
+                return;
+            };
+            if applied_active.peek().as_ref() == Some(&panel) {
+                return;
+            }
             if !requested_registry
                 .iter()
                 .any(|placement| placement.panel == panel)
             {
+                // Not registered yet: leave the request pending so the panel
+                // comes to the front when it arrives.
                 return;
             }
-            let mut next = layout();
+            let mut next = layout.peek().clone();
             next.reconcile(&requested_registry);
             if next.activate(&panel) {
                 layout.set(next.clone());
-                requested_layout_change.call(next);
-                requested_resize.call(());
+                on_layout_change.call(next);
+                on_resize.call(());
             }
+            applied_active.set(Some(panel));
         },
     ));
 
-    let display_layout = layout().reconciled(&placements);
-    let context = RenderContext {
-        panels,
-        placements,
-        layout,
-        reset_layout: reset_layout.unwrap_or(initial_layout),
-        display_tile_count: display_layout.tile_count(),
-        dragging,
-        drop_preview,
-        resizing,
-        split_mounts,
-        on_layout_change,
-        on_panel_activate,
-        on_panel_close,
-        on_resize,
-    };
-    let pointer_context = context.clone();
-    let release_context = context.clone();
-    let cancel_context = context.clone();
+    // The reconciled tree is what actually renders. Memoized so a layout
+    // write that reconciles to the same tree re-renders nothing.
+    let display_placements = placements;
+    let display_layout = use_memo(use_reactive((&display_placements,), move |(placements,)| {
+        layout().reconciled(&placements)
+    }));
+
+    let display = display_layout();
+    let display_tile_count = display.tile_count();
     let resizing_active = resizing().is_some();
     let dragging_active = dragging().is_some();
 
     rsx! {
         if owns_style {
-            document::Style { {STYLE} }
+            WorkbenchStyle {}
         }
         section {
             class: "wb-workspace",
             "data-resizing": resizing_active,
             "data-dragging": dragging_active,
+            // While a splitter drag is live, pointer moves write flex-basis
+            // straight to the DOM. Committing the layout per move would
+            // re-render the workspace and invite consumers to persist at
+            // pointer frequency; the settled commit happens on release.
             onpointermove: move |event| {
-                let Some(active) = resizing() else { return };
+                let Some(active) = resizing.peek().clone() else { return };
                 let pointer = match active.axis {
                     SplitAxis::Horizontal => event.data().client_coordinates().x,
                     SplitAxis::Vertical => event.data().client_coordinates().y,
                 };
-                let next_ratio = active.start_ratio
-                    + (pointer - active.pointer_origin) / active.span;
-                let mut next = layout();
-                if next.set_split_ratio(&active.split, next_ratio) {
-                    layout.set(next.clone());
-                    pointer_context.on_layout_change.call(next);
-                    pointer_context.on_resize.call(());
-                }
+                let next_ratio = drag_ratio(&active, pointer);
+                dom::set_flex_basis(&active.first_child_dom, next_ratio * 100.0);
             },
-            onpointerup: move |_| {
-                if resizing().is_some() {
-                    resizing.set(None);
-                    let next = layout();
-                    release_context.on_layout_change.call(next);
-                    release_context.on_resize.call(());
+            onpointerup: move |event| {
+                let Some(active) = resizing.peek().clone() else { return };
+                resizing.set(None);
+                let pointer = match active.axis {
+                    SplitAxis::Horizontal => event.data().client_coordinates().x,
+                    SplitAxis::Vertical => event.data().client_coordinates().y,
+                };
+                let next_ratio = drag_ratio(&active, pointer);
+                let committed = mutate_layout(shared, |layout| {
+                    layout.set_split_ratio(&active.split, next_ratio)
+                });
+                if !committed {
+                    // No net movement: the render above never happens, so put
+                    // back the style the transient drag wrote.
+                    dom::set_flex_basis(&active.first_child_dom, active.start_ratio * 100.0);
                 }
             },
             onpointercancel: move |_| {
-                let Some(active) = resizing() else { return };
+                let Some(active) = resizing.peek().clone() else { return };
                 resizing.set(None);
-                let mut next = layout();
-                if next.set_split_ratio(&active.split, active.start_ratio) {
-                    layout.set(next.clone());
-                    cancel_context.on_layout_change.call(next);
-                    cancel_context.on_resize.call(());
-                }
+                dom::set_flex_basis(&active.first_child_dom, active.start_ratio * 100.0);
             },
             ondragend: move |_| {
                 dragging.set(None);
                 drop_preview.set(None);
             },
-            {render_node(display_layout.root, context)}
+            NodeView { node: display.root, panels, display_tile_count }
         }
     }
 }
 
-fn render_node(node: LayoutNode, context: RenderContext) -> Element {
+/// One node of the reconciled tree. A dedicated component (rather than a
+/// plain function) keeps signal subscriptions inside the subtree that needs
+/// them and lets unchanged branches skip re-rendering entirely.
+#[component]
+fn NodeView(node: LayoutNode, panels: Vec<Panel>, display_tile_count: usize) -> Element {
     match node {
-        LayoutNode::Tile(tile) => render_tile(tile, context),
+        LayoutNode::Tile(tile) => rsx! {
+            TileView { tile, panels, display_tile_count }
+        },
         LayoutNode::Split {
             id,
             axis,
             ratio,
             first,
             second,
-        } => {
-            let splitter_dom_id = format!("wb-splitter-{}", safe_id(id.as_str()));
-            let orientation = match axis {
-                SplitAxis::Horizontal => "vertical",
-                SplitAxis::Vertical => "horizontal",
-            };
-            let split_class = match axis {
-                SplitAxis::Horizontal => "wb-split wb-split-horizontal",
-                SplitAxis::Vertical => "wb-split wb-split-vertical",
-            };
-            let first_style = format!("flex-basis: {:.5}%;", ratio * 100.0);
-            let first_context = context.clone();
-            let second_context = context.clone();
-            let mut split_mounts = context.split_mounts;
-            let pointer_resizing = context.resizing;
-            let pointer_mounts = context.split_mounts;
-            let keyboard_context = context.clone();
-            let reset_context = context.clone();
-            let mounted_split = id.clone();
-            let pointer_split = id.clone();
-            let keyboard_split = id.clone();
-            let reset_split = id.clone();
-            let reset_ratio = context.reset_layout.split_ratio(&id).unwrap_or(0.5);
-            let splitter_class = if (context.resizing)()
-                .as_ref()
-                .is_some_and(|active| active.split == id)
-            {
-                "wb-splitter wb-splitter-active"
-            } else {
-                "wb-splitter"
-            };
+        } => rsx! {
+            SplitView {
+                id,
+                axis,
+                ratio,
+                first: *first,
+                second: *second,
+                panels,
+                display_tile_count,
+            }
+        },
+    }
+}
 
-            rsx! {
-                div {
-                    class: "{split_class}",
-                    onmounted: move |event| {
-                        split_mounts.write().insert(mounted_split.clone(), event.data());
-                    },
-                    div { class: "wb-split-child wb-split-first", style: "{first_style}",
-                        {render_node(*first, first_context)}
-                    }
-                    div {
-                        id: "{splitter_dom_id}",
-                        class: "{splitter_class}",
-                        role: "separator",
-                        tabindex: "0",
-                        "aria-label": "Resize panel groups",
-                        "aria-orientation": "{orientation}",
-                        "aria-valuemin": (MIN_SPLIT_RATIO * 100.0) as i64,
-                        "aria-valuemax": (MAX_SPLIT_RATIO * 100.0) as i64,
-                        "aria-valuenow": (ratio * 100.0).round() as i64,
-                        title: "Drag to resize. Arrow keys resize; Shift moves farther; double-click resets.",
-                        onpointerdown: {
-                            let splitter_dom_id = splitter_dom_id.clone();
-                            move |event: PointerEvent| {
-                                let Some(mount) = pointer_mounts.peek().get(&pointer_split).cloned() else {
-                                    return;
-                                };
-                                event.prevent_default();
-                                dom::capture_pointer(&splitter_dom_id, event.data().pointer_id());
-                                let pointer = match axis {
-                                    SplitAxis::Horizontal => event.data().client_coordinates().x,
-                                    SplitAxis::Vertical => event.data().client_coordinates().y,
-                                };
-                                let split = pointer_split.clone();
-                                let mut resizing = pointer_resizing;
-                                spawn(async move {
-                                    let Ok(bounds) = mount.get_client_rect().await else { return };
-                                    let span = match axis {
-                                        SplitAxis::Horizontal => bounds.width(),
-                                        SplitAxis::Vertical => bounds.height(),
-                                    };
-                                    if !span.is_finite() || span <= 0.0 {
-                                        return;
-                                    }
-                                    resizing.set(Some(ResizeDrag {
-                                        split,
-                                        axis,
-                                        pointer_origin: pointer,
-                                        start_ratio: ratio,
-                                        span,
-                                    }));
-                                });
+#[component]
+fn SplitView(
+    id: SplitId,
+    axis: SplitAxis,
+    ratio: f64,
+    first: LayoutNode,
+    second: LayoutNode,
+    panels: Vec<Panel>,
+    display_tile_count: usize,
+) -> Element {
+    let shared = use_context::<WorkspaceShared>();
+    let strings = shared.strings.read().clone();
+    let splitter_dom_id = format!("wb-splitter-{}", safe_id(id.as_str()));
+    let first_child_dom = format!("wb-split-first-{}", safe_id(id.as_str()));
+    let orientation = match axis {
+        SplitAxis::Horizontal => "vertical",
+        SplitAxis::Vertical => "horizontal",
+    };
+    let split_class = match axis {
+        SplitAxis::Horizontal => "wb-split wb-split-horizontal",
+        SplitAxis::Vertical => "wb-split wb-split-vertical",
+    };
+    let first_style = format!("flex-basis: {:.5}%;", ratio * 100.0);
+    // Only this splitter re-renders when a drag starts or ends on it.
+    let splitter_active = use_memo(use_reactive((&id,), move |(id,)| {
+        shared
+            .resizing
+            .read()
+            .as_ref()
+            .is_some_and(|active| active.split == id)
+    }));
+    let splitter_class = if splitter_active() {
+        "wb-splitter wb-splitter-active"
+    } else {
+        "wb-splitter"
+    };
+    let mut split_mounts = shared.split_mounts;
+    let mounted_split = id.clone();
+    let pointer_split = id.clone();
+    let keyboard_split = id.clone();
+    let reset_split = id.clone();
+
+    rsx! {
+        div {
+            class: "{split_class}",
+            onmounted: move |event| {
+                split_mounts.write().insert(mounted_split.clone(), event.data());
+            },
+            div {
+                id: "{first_child_dom}",
+                class: "wb-split-child wb-split-first",
+                style: "{first_style}",
+                NodeView { node: first, panels: panels.clone(), display_tile_count }
+            }
+            div {
+                id: "{splitter_dom_id}",
+                class: "{splitter_class}",
+                role: "separator",
+                tabindex: "0",
+                "aria-label": "{strings.splitter_label}",
+                "aria-orientation": "{orientation}",
+                "aria-valuemin": (MIN_SPLIT_RATIO * 100.0) as i64,
+                "aria-valuemax": (MAX_SPLIT_RATIO * 100.0) as i64,
+                "aria-valuenow": (ratio * 100.0).round() as i64,
+                title: "{strings.splitter_hint}",
+                onpointerdown: {
+                    let splitter_dom_id = splitter_dom_id.clone();
+                    let first_child_dom = first_child_dom.clone();
+                    move |event: PointerEvent| {
+                        let Some(mount) = shared.split_mounts.peek().get(&pointer_split).cloned() else {
+                            return;
+                        };
+                        event.prevent_default();
+                        dom::capture_pointer(&splitter_dom_id, event.data().pointer_id());
+                        let pointer = match axis {
+                            SplitAxis::Horizontal => event.data().client_coordinates().x,
+                            SplitAxis::Vertical => event.data().client_coordinates().y,
+                        };
+                        let split = pointer_split.clone();
+                        let first_child_dom = first_child_dom.clone();
+                        let mut resizing = shared.resizing;
+                        spawn(async move {
+                            let Ok(bounds) = mount.get_client_rect().await else { return };
+                            let span = match axis {
+                                SplitAxis::Horizontal => bounds.width(),
+                                SplitAxis::Vertical => bounds.height(),
+                            };
+                            if !span.is_finite() || span <= 0.0 {
+                                return;
                             }
-                        },
-                        ondoubleclick: move |_| {
-                            mutate_layout(reset_context.clone(), |layout| {
-                                layout.set_split_ratio(&reset_split, reset_ratio)
-                            });
-                        },
-                        onkeydown: move |event| {
-                            let step = if event.modifiers().shift() {
-                                RESIZE_KEYBOARD_LARGE_STEP
-                            } else {
-                                RESIZE_KEYBOARD_STEP
-                            };
-                            let delta = match (axis, event.key()) {
-                                (SplitAxis::Horizontal, Key::ArrowLeft)
-                                | (SplitAxis::Vertical, Key::ArrowUp) => -step,
-                                (SplitAxis::Horizontal, Key::ArrowRight)
-                                | (SplitAxis::Vertical, Key::ArrowDown) => step,
-                                _ => return,
-                            };
-                            event.prevent_default();
-                            mutate_layout(keyboard_context.clone(), |layout| {
-                                let Some(current) = layout.split_ratio(&keyboard_split) else {
-                                    return false;
-                                };
-                                layout.set_split_ratio(&keyboard_split, current + delta)
-                            });
-                        },
+                            resizing.set(Some(ResizeDrag {
+                                split,
+                                axis,
+                                pointer_origin: pointer,
+                                start_ratio: ratio,
+                                span,
+                                first_child_dom,
+                            }));
+                        });
                     }
-                    div { class: "wb-split-child wb-split-second",
-                        {render_node(*second, second_context)}
-                    }
-                }
+                },
+                ondoubleclick: move |_| {
+                    let target = shared
+                        .reset_layout
+                        .peek()
+                        .split_ratio(&reset_split)
+                        .unwrap_or(0.5);
+                    mutate_layout(shared, |layout| layout.set_split_ratio(&reset_split, target));
+                },
+                onkeydown: move |event| {
+                    let step = if event.modifiers().shift() {
+                        RESIZE_KEYBOARD_LARGE_STEP
+                    } else {
+                        RESIZE_KEYBOARD_STEP
+                    };
+                    let delta = match (axis, event.key()) {
+                        (SplitAxis::Horizontal, Key::ArrowLeft)
+                        | (SplitAxis::Vertical, Key::ArrowUp) => -step,
+                        (SplitAxis::Horizontal, Key::ArrowRight)
+                        | (SplitAxis::Vertical, Key::ArrowDown) => step,
+                        _ => return,
+                    };
+                    event.prevent_default();
+                    mutate_layout(shared, |layout| {
+                        let Some(current) = layout.split_ratio(&keyboard_split) else {
+                            return false;
+                        };
+                        layout.set_split_ratio(&keyboard_split, current + delta)
+                    });
+                },
+            }
+            div { class: "wb-split-child wb-split-second",
+                NodeView { node: second, panels, display_tile_count }
             }
         }
     }
 }
 
-fn render_tile(tile: Tile, context: RenderContext) -> Element {
-    let tile_id = tile.id.clone();
-    let preview = (context.drop_preview)().filter(|preview| preview.tile == tile.id);
+#[component]
+fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Element {
+    let shared = use_context::<WorkspaceShared>();
+    // Memoized per tile: crossing drop zones mid-drag re-renders only the
+    // tile whose preview state actually changed, not the whole tree.
+    let drop_active = use_memo(use_reactive((&tile.id,), move |(tile_id,)| {
+        shared
+            .drop_preview
+            .read()
+            .as_ref()
+            .is_some_and(|preview| preview.tile == tile_id)
+    }));
+    let dragging_active = use_memo(move || shared.dragging.read().is_some());
+    let strings = shared.strings.read().clone();
     let mut tile_classes = vec!["wb-tile"];
-    if preview.is_some() {
+    if drop_active() {
         tile_classes.push("wb-tile-drop-active");
     }
     if tile.id.as_str().starts_with("tile-") {
         tile_classes.push("wb-tile-enter");
     }
     let tile_class = tile_classes.join(" ");
-    let right_context = context.clone();
-    let down_context = context.clone();
-    let close_context = context.clone();
     let right_tile = tile.id.clone();
     let down_tile = tile.id.clone();
     let close_tile = tile.id.clone();
+    let tabs_dom_id = format!("wb-tabs-{}", safe_id(tile.id.as_str()));
+    let wheel_tabs_dom_id = tabs_dom_id.clone();
+    // Name each tab strip after its active panel, so assistive technology
+    // can tell four "Panel group"s apart.
+    let group_label = tile
+        .active
+        .as_ref()
+        .and_then(|active| panels.iter().find(|panel| &panel.id == active))
+        .map(|panel| strings.tab_group_labelled.replace("{panel}", &panel.title))
+        .unwrap_or_else(|| strings.tab_group_label.clone());
 
     rsx! {
         section { key: "{tile.id}", class: "{tile_class}", "data-tile-id": "{tile.id}",
             header { class: "wb-tab-bar wb-hover-host",
-                div { class: "wb-tabs", role: "tablist", "aria-label": "Panel group",
+                div {
+                    id: "{tabs_dom_id}",
+                    class: "wb-tabs",
+                    role: "tablist",
+                    "aria-label": "{group_label}",
+                    // A vertical wheel walks an overflowed strip sideways,
+                    // the way editors train. Harmless when nothing overflows.
+                    onwheel: move |event| {
+                        let delta = match event.data().delta() {
+                            WheelDelta::Pixels(vector) => vector.y,
+                            WheelDelta::Lines(vector) => vector.y * 16.0,
+                            WheelDelta::Pages(vector) => vector.y * 160.0,
+                        };
+                        dom::scroll_by_x(&wheel_tabs_dom_id, delta);
+                    },
                     for panel_id in &tile.panels {
-                        if let Some(panel) = context.panels.iter().find(|panel| &panel.id == panel_id) {
-                            {render_tab(panel.clone(), &tile, context.clone())}
+                        if let Some(panel) = panels.iter().find(|panel| &panel.id == panel_id) {
+                            TabItem {
+                                key: "{panel.id}",
+                                panel: panel.clone(),
+                                tile_id: tile.id.clone(),
+                                is_active: tile.active.as_ref() == Some(&panel.id),
+                                tab_order: tile.panels.clone(),
+                            }
                         }
                     }
                     if tile.panels.is_empty() {
-                        span { class: "wb-empty-label", "Empty group" }
+                        span { class: "wb-empty-label", "{strings.empty_group_label}" }
                     }
                 }
                 div { class: "wb-tile-actions",
                     button {
                         r#type: "button",
                         class: "wb-tile-action wb-icon-btn wb-hover-action",
-                        "aria-label": "Split panel group right",
-                        title: "Split right (Alt+Shift+Right)",
+                        "aria-label": "{strings.split_right_label}",
+                        title: "{strings.split_right_hint}",
                         onclick: move |_| {
-                            mutate_layout(right_context.clone(), |layout| {
+                            mutate_layout(shared, |layout| {
                                 layout.split_active(&right_tile, DockZone::Right)
                             });
                         },
@@ -458,23 +678,23 @@ fn render_tile(tile: Tile, context: RenderContext) -> Element {
                     button {
                         r#type: "button",
                         class: "wb-tile-action wb-icon-btn wb-hover-action",
-                        "aria-label": "Split panel group down",
-                        title: "Split down (Alt+Shift+Down)",
+                        "aria-label": "{strings.split_down_label}",
+                        title: "{strings.split_down_hint}",
                         onclick: move |_| {
-                            mutate_layout(down_context.clone(), |layout| {
+                            mutate_layout(shared, |layout| {
                                 layout.split_active(&down_tile, DockZone::Bottom)
                             });
                         },
                         SplitDownIcon {}
                     }
-                    if tile.panels.is_empty() && context.display_tile_count > 1 {
+                    if tile.panels.is_empty() && display_tile_count > 1 {
                         button {
                             r#type: "button",
                             class: "wb-tile-action wb-icon-btn wb-hover-action",
-                            "aria-label": "Close empty panel group",
-                            title: "Close empty group",
+                            "aria-label": "{strings.close_empty_label}",
+                            title: "{strings.close_empty_hint}",
                             onclick: move |_| {
-                                mutate_layout(close_context.clone(), |layout| {
+                                mutate_layout(shared, |layout| {
                                     layout.remove_empty_tile(&close_tile)
                                 });
                             },
@@ -485,7 +705,7 @@ fn render_tile(tile: Tile, context: RenderContext) -> Element {
             }
             div { class: "wb-panel-frame",
                 for panel_id in &tile.panels {
-                    if let Some(panel) = context.panels.iter().find(|panel| &panel.id == panel_id) {
+                    if let Some(panel) = panels.iter().find(|panel| &panel.id == panel_id) {
                         {
                             let is_active = tile.active.as_ref() == Some(&panel.id);
                             let panel_dom = panel_dom_id(&panel.id);
@@ -507,26 +727,31 @@ fn render_tile(tile: Tile, context: RenderContext) -> Element {
                 }
                 if tile.panels.is_empty() {
                     div { class: "wb-empty-tile",
-                        strong { "Empty panel group" }
-                        span { "Drag a panel tab here, or close this group." }
+                        strong { "{strings.empty_tile_title}" }
+                        span { "{strings.empty_tile_hint}" }
+                        span { class: "wb-empty-keys", "{strings.empty_tile_keys}" }
                     }
                 }
             }
-            if (context.dragging)().is_some() {
-                DockOverlay { tile: tile_id, preview, context }
+            if dragging_active() {
+                DockOverlay { tile: tile.id.clone() }
             }
         }
     }
 }
 
-fn render_tab(panel: Panel, tile: &Tile, context: RenderContext) -> Element {
+#[component]
+fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelId>) -> Element {
+    let shared = use_context::<WorkspaceShared>();
+    let strings = shared.strings.read().clone();
     let panel_id = panel.id.clone();
     let activate_id = panel.id.clone();
     let drag_id = panel.id.clone();
     let key_id = panel.id.clone();
     let close_id = panel.id.clone();
+    let menu_id = panel.id.clone();
     let title = panel.title.clone();
-    let is_active = tile.active.as_ref() == Some(&panel.id);
+    let close_label = strings.close_tab.replace("{title}", &title);
     let tab_id = tab_dom_id(&panel.id);
     let controlled_panel_id = panel_dom_id(&panel.id);
     let tab_index = if is_active { "0" } else { "-1" };
@@ -535,14 +760,22 @@ fn render_tab(panel: Panel, tile: &Tile, context: RenderContext) -> Element {
     } else {
         "wb-tab-item"
     };
-    let activate_context = context.clone();
-    let close_context = context.clone();
-    let keyboard_context = context.clone();
-    let mut drag_signal = context.dragging;
-    let mut drag_preview_signal = context.drop_preview;
-    let drag_tile = tile.id.clone();
-    let keyboard_tile = tile.id.clone();
-    let tab_order = tile.panels.clone();
+    let mut drag_signal = shared.dragging;
+    let mut drag_preview_signal = shared.drop_preview;
+    let drag_tile = tile_id.clone();
+    let keyboard_tile = tile_id.clone();
+    let menu_tile = tile_id.clone();
+
+    // An activated tab may sit outside a crowded strip's viewport — after a
+    // drop, a programmatic request, or a restored session. Bring it in.
+    {
+        let scroll_target = tab_id.clone();
+        use_effect(use_reactive((&is_active,), move |(active,)| {
+            if active {
+                dom::scroll_into_view(&scroll_target);
+            }
+        }));
+    }
 
     rsx! {
         div { key: "{panel_id}", class: "{tab_item_class} wb-hover-host",
@@ -555,10 +788,21 @@ fn render_tab(panel: Panel, tile: &Tile, context: RenderContext) -> Element {
                 tabindex: "{tab_index}",
                 "aria-selected": is_active,
                 "aria-controls": "{controlled_panel_id}",
-                title: "{title}. Drag to dock; Alt+Shift+Arrow splits; Alt+Shift+Page Up or Down moves between groups.",
+                title: "{title}. {strings.tab_hint}",
                 onclick: move |_| {
-                    mutate_layout(activate_context.clone(), |layout| layout.activate(&activate_id));
-                    activate_context.on_panel_activate.call(activate_id.clone());
+                    mutate_layout(shared, |layout| layout.activate(&activate_id));
+                    shared.on_panel_activate.call(activate_id.clone());
+                },
+                oncontextmenu: move |event: MouseEvent| {
+                    let Some(menu) = shared.on_tab_menu else { return };
+                    event.prevent_default();
+                    let point = event.data().client_coordinates();
+                    menu.call(TabMenuRequest {
+                        panel: menu_id.clone(),
+                        tile: menu_tile.clone(),
+                        x: point.x,
+                        y: point.y,
+                    });
                 },
                 ondragstart: move |_: DragEvent| {
                     drag_signal.set(Some(drag_id.clone()));
@@ -580,13 +824,19 @@ fn render_tab(panel: Panel, tile: &Tile, context: RenderContext) -> Element {
                         };
                         let Some(action) = action else { return };
                         event.prevent_default();
-                        mutate_layout(keyboard_context.clone(), |layout| match action {
+                        let mutated = mutate_layout(shared, |layout| match action {
                             KeyboardDock::Split(zone) => {
                                 layout.dock_panel(&key_id, &keyboard_tile, zone)
                                     || layout.split_tile(&keyboard_tile, zone).is_some()
                             }
                             KeyboardDock::Move(delta) => layout.move_panel_by_tile(&key_id, delta),
                         });
+                        if mutated {
+                            // The mutation re-renders the tab elsewhere in the
+                            // tree; without this the keyboard flow strands
+                            // focus on <body>.
+                            dom::focus_after_render(tab_dom_id(&key_id));
+                        }
                         return;
                     }
                     let Some(current) = tab_order.iter().position(|panel| panel == &key_id) else {
@@ -601,19 +851,25 @@ fn render_tab(panel: Panel, tile: &Tile, context: RenderContext) -> Element {
                     };
                     event.prevent_default();
                     let target = tab_order[target].clone();
-                    mutate_layout(keyboard_context.clone(), |layout| layout.activate(&target));
-                    keyboard_context.on_panel_activate.call(target.clone());
+                    mutate_layout(shared, |layout| layout.activate(&target));
+                    shared.on_panel_activate.call(target.clone());
                     dom::focus_after_render(tab_dom_id(&target));
                 },
+                if let Some(icon) = panel.tab_icon.clone() {
+                    span { class: "wb-tab-icon", "aria-hidden": "true", {icon} }
+                }
                 span { class: "wb-tab-label", "{title}" }
+                if let Some(accessory) = panel.tab_accessory.clone() {
+                    span { class: "wb-tab-accessory", {accessory} }
+                }
             }
             if panel.closable {
                 button {
                     r#type: "button",
                     class: "wb-tab-close wb-icon-btn wb-hover-action",
-                    "aria-label": "Close {title}",
-                    title: "Close {title}",
-                    onclick: move |_| close_context.on_panel_close.call(close_id.clone()),
+                    "aria-label": "{close_label}",
+                    title: "{close_label}",
+                    onclick: move |_| shared.on_panel_close.call(close_id.clone()),
                     CloseIcon {}
                 }
             }
@@ -628,8 +884,19 @@ enum KeyboardDock {
 }
 
 #[component]
-fn DockOverlay(tile: TileId, preview: Option<DropPreview>, context: RenderContext) -> Element {
-    let preview_class = preview
+fn DockOverlay(tile: TileId) -> Element {
+    let shared = use_context::<WorkspaceShared>();
+    // Value-gated per tile: only the overlays whose preview changed re-render
+    // as the drag crosses zones.
+    let preview = use_memo(use_reactive((&tile,), move |(tile,)| {
+        shared
+            .drop_preview
+            .read()
+            .clone()
+            .filter(|preview| preview.tile == tile)
+    }));
+    let preview_value = preview();
+    let preview_class = preview_value
         .as_ref()
         .map(|preview| {
             format!(
@@ -643,10 +910,9 @@ fn DockOverlay(tile: TileId, preview: Option<DropPreview>, context: RenderContex
         div { class: "wb-dock-overlay", "aria-hidden": "true",
             for zone in [DockZone::Left, DockZone::Right, DockZone::Top, DockZone::Bottom, DockZone::Center] {
                 {
-                    let drop_context = context.clone();
-                    let mut enter_preview_signal = context.drop_preview;
-                    let mut drop_dragging_signal = context.dragging;
-                    let mut drop_preview_signal = context.drop_preview;
+                    let mut enter_preview_signal = shared.drop_preview;
+                    let mut drop_dragging_signal = shared.dragging;
+                    let mut drop_preview_signal = shared.drop_preview;
                     let enter_tile = tile.clone();
                     let drop_tile = tile.clone();
                     rsx! {
@@ -663,11 +929,11 @@ fn DockOverlay(tile: TileId, preview: Option<DropPreview>, context: RenderContex
                             ondragover: move |event| event.prevent_default(),
                             ondrop: move |event| {
                                 event.prevent_default();
-                                let Some(panel) = drop_dragging_signal() else { return };
-                                mutate_layout(drop_context.clone(), |layout| {
+                                let Some(panel) = drop_dragging_signal.peek().clone() else { return };
+                                mutate_layout(shared, |layout| {
                                     layout.dock_panel(&panel, &drop_tile, zone)
                                 });
-                                drop_context.on_panel_activate.call(panel);
+                                shared.on_panel_activate.call(panel);
                                 drop_dragging_signal.set(None);
                                 drop_preview_signal.set(None);
                             },
@@ -675,7 +941,7 @@ fn DockOverlay(tile: TileId, preview: Option<DropPreview>, context: RenderContex
                     }
                 }
             }
-            if preview.is_some() {
+            if preview_value.is_some() {
                 div { class: "{preview_class}" }
                 div { class: "wb-drop-compass", DockCompassIcon {} }
             }
@@ -683,22 +949,59 @@ fn DockOverlay(tile: TileId, preview: Option<DropPreview>, context: RenderContex
     }
 }
 
-fn mutate_layout(context: RenderContext, mutation: impl FnOnce(&mut PanelLayout) -> bool) {
-    let mut layout_signal = context.layout;
-    let mut next = layout_signal();
-    next.reconcile(&context.placements);
+/// Reconcile against the current registry, apply one mutation, and — only if
+/// it changed anything — commit the layout and fire the settled callbacks.
+/// Returns whether a commit happened.
+fn mutate_layout(shared: WorkspaceShared, mutation: impl FnOnce(&mut PanelLayout) -> bool) -> bool {
+    let mut layout_signal = shared.layout;
+    let mut next = layout_signal.peek().clone();
+    next.reconcile(&shared.placements.peek());
     if !mutation(&mut next) {
-        return;
+        return false;
     }
+    // Structural mutations can drop splits; release their mount handles so
+    // the map does not grow for the session's lifetime.
+    let live = next.split_ids().into_iter().collect::<HashSet<_>>();
+    let mut split_mounts = shared.split_mounts;
+    split_mounts.write().retain(|split, _| live.contains(split));
     layout_signal.set(next.clone());
-    context.on_layout_change.call(next);
-    context.on_resize.call(());
+    shared.on_layout_change.call(next);
+    shared.on_resize.call(());
+    true
+}
+
+fn drag_ratio(drag: &ResizeDrag, pointer: f64) -> f64 {
+    let raw = drag.start_ratio + (pointer - drag.pointer_origin) / drag.span;
+    if raw.is_finite() {
+        raw.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO)
+    } else {
+        drag.start_ratio
+    }
 }
 
 fn layout_for_registry(initial_layout: PanelLayout, placements: &[PanelPlacement]) -> PanelLayout {
     let mut layout = initial_layout;
+    if let Err(issue) = layout.validate() {
+        tracing::warn!(
+            "dioxus-workbench: the initial layout is invalid ({issue}); \
+             reconciliation will repair what it can"
+        );
+    }
     layout.reconcile(placements);
     layout
+}
+
+fn warn_duplicate_panels(placements: &[PanelPlacement]) {
+    let mut seen = HashSet::new();
+    for placement in placements {
+        if !seen.insert(&placement.panel) {
+            tracing::warn!(
+                "dioxus-workbench: duplicate panel id `{}` in the registry; \
+                 only the first registration renders",
+                placement.panel
+            );
+        }
+    }
 }
 
 fn zone_name(zone: DockZone) -> &'static str {

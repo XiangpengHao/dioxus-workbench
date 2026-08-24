@@ -54,6 +54,9 @@ fn App() -> Element {
     // The Preview panel can be closed from its tab and reopened from the
     // editor, exercising a registry that changes at runtime.
     let mut preview_open = use_signal(|| false);
+    // Destroying three activities' layouts deserves a second click. The armed
+    // state disarms itself after a beat so it cannot linger.
+    let mut reset_armed = use_signal(|| false);
 
     let current = activity();
     let rail = rsx! {
@@ -118,8 +121,21 @@ fn App() -> Element {
                 }
                 StatusItem { tone: StatusTone::Accent, "Layouts persist per activity" }
                 StatusItem {
-                    title: "Clear the saved layouts and reload",
+                    tone: if reset_armed() { StatusTone::Danger } else { StatusTone::Neutral },
+                    title: if reset_armed() {
+                        "Click again to clear every saved layout and reload"
+                    } else {
+                        "Clear the saved layouts and reload"
+                    },
                     onclick: move |_| {
+                        if !reset_armed() {
+                            reset_armed.set(true);
+                            spawn(async move {
+                                gloo_timers::future::TimeoutFuture::new(4_000).await;
+                                reset_armed.set(false);
+                            });
+                            return;
+                        }
                         spawn(async move {
                             let _ = document::eval(
                                 "for (const key of Object.keys(window.localStorage)) { \
@@ -132,7 +148,7 @@ fn App() -> Element {
                             .await;
                         });
                     },
-                    "Reset layouts"
+                    if reset_armed() { "Confirm reset" } else { "Reset layouts" }
                 }
             },
         }
@@ -196,6 +212,12 @@ fn ActivityWorkspace(
         Activity::Docs | Activity::Settings => docs_workspace(),
     };
     let initial_layout = saved.unwrap_or_else(|| default_layout.clone());
+    // The status line speaks in tab titles, not internal panel ids.
+    let titles = panels
+        .iter()
+        .map(|panel| (panel.id.clone(), panel.title.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let menu_titles = titles.clone();
 
     rsx! {
         PanelWorkspace {
@@ -207,7 +229,18 @@ fn ActivityWorkspace(
                 save_layout(&storage_key, &layout);
             },
             on_panel_activate: move |panel: PanelId| {
-                on_event.call(format!("Opened {panel}"));
+                let name = titles
+                    .get(&panel)
+                    .cloned()
+                    .unwrap_or_else(|| panel.to_string());
+                on_event.call(format!("Opened {name}"));
+            },
+            on_tab_menu: move |request: TabMenuRequest| {
+                let name = menu_titles
+                    .get(&request.panel)
+                    .cloned()
+                    .unwrap_or_else(|| request.panel.to_string());
+                on_event.call(format!("Context menu on {name} — the app draws the menu"));
             },
             on_panel_close: move |panel: PanelId| {
                 if panel.as_str() == "preview" {
@@ -235,14 +268,20 @@ fn code_workspace(
                     preview_open,
                     on_open_preview: move |_| {
                         on_preview_change.call(true);
-                        on_event.call("Opened Preview beside the editor".to_owned());
+                        on_event.call("Opened Preview".to_owned());
                     },
                 }
             },
         ),
         Panel::new("readme", "README.md", "main", rsx! { Readme {} }),
         Panel::new("terminal", "Terminal", "bottom", rsx! { Terminal {} }),
-        Panel::new("problems", "Problems", "bottom", rsx! { Problems {} }),
+        // The accessory slot carries application meaning on the tab itself —
+        // here, the same problem count the status bar reports.
+        Panel::new("problems", "Problems", "bottom", rsx! { Problems {} }).with_tab_accessory(
+            rsx! {
+                span { class: "demo-tab-badge", "aria-label": "2 problems", "2" }
+            },
+        ),
     ];
     if preview_open {
         panels.push(

@@ -470,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "dioxus-workbench",
+ "gloo-timers",
  "wasm-bindgen",
 ]
 
@@ -958,6 +959,7 @@ dependencies = [
  "gloo-timers",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
