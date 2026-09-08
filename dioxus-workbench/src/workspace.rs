@@ -227,6 +227,7 @@ pub fn PanelWorkspace(
 ) -> Element {
     let owns_style = use_style_owner();
     let placements = panels.iter().map(Panel::placement).collect::<Vec<_>>();
+    use_context_provider(WorkspaceDomIds::new);
     // With no explicit first arrangement, derive one from panel homes.
     let resolved_initial = initial_layout.unwrap_or_else(|| PanelLayout::from_homes(&placements));
     let initial_placements = placements.clone();
@@ -466,9 +467,10 @@ fn SplitView(
     display_tile_count: usize,
 ) -> Element {
     let shared = use_context::<WorkspaceShared>();
+    let dom_ids = use_context::<WorkspaceDomIds>();
     let strings = shared.strings.read().clone();
-    let splitter_dom_id = format!("wb-splitter-{}", safe_id(id.as_str()));
-    let first_child_dom = format!("wb-split-first-{}", safe_id(id.as_str()));
+    let splitter_dom_id = dom_ids.element("splitter", id.as_str());
+    let first_child_dom = dom_ids.element("split-first", id.as_str());
     let orientation = match axis {
         SplitAxis::Horizontal => "vertical",
         SplitAxis::Vertical => "horizontal",
@@ -596,6 +598,7 @@ fn SplitView(
 #[component]
 fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Element {
     let shared = use_context::<WorkspaceShared>();
+    let dom_ids = use_context::<WorkspaceDomIds>();
     // Memoized per tile: crossing drop zones mid-drag re-renders only the
     // tile whose preview state actually changed, not the whole tree.
     let drop_active = use_memo(use_reactive((&tile.id,), move |(tile_id,)| {
@@ -618,7 +621,7 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
     let right_tile = tile.id.clone();
     let down_tile = tile.id.clone();
     let close_tile = tile.id.clone();
-    let tabs_dom_id = format!("wb-tabs-{}", safe_id(tile.id.as_str()));
+    let tabs_dom_id = dom_ids.element("tabs", tile.id.as_str());
     let wheel_tabs_dom_id = tabs_dom_id.clone();
     // Name each tab strip after its active panel, so assistive technology
     // can tell four "Panel group"s apart.
@@ -708,8 +711,8 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
                     if let Some(panel) = panels.iter().find(|panel| &panel.id == panel_id) {
                         {
                             let is_active = tile.active.as_ref() == Some(&panel.id);
-                            let panel_dom = panel_dom_id(&panel.id);
-                            let labelled_by = tab_dom_id(&panel.id);
+                            let panel_dom = dom_ids.panel(&panel.id);
+                            let labelled_by = dom_ids.tab(&panel.id);
                             rsx! {
                                 div {
                                     key: "{panel.id}",
@@ -743,6 +746,7 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
 #[component]
 fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelId>) -> Element {
     let shared = use_context::<WorkspaceShared>();
+    let dom_ids = use_context::<WorkspaceDomIds>();
     let strings = shared.strings.read().clone();
     let panel_id = panel.id.clone();
     let activate_id = panel.id.clone();
@@ -752,8 +756,8 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
     let menu_id = panel.id.clone();
     let title = panel.title.clone();
     let close_label = strings.close_tab.replace("{title}", &title);
-    let tab_id = tab_dom_id(&panel.id);
-    let controlled_panel_id = panel_dom_id(&panel.id);
+    let tab_id = dom_ids.tab(&panel.id);
+    let controlled_panel_id = dom_ids.panel(&panel.id);
     let tab_index = if is_active { "0" } else { "-1" };
     let tab_item_class = if is_active {
         "wb-tab-item wb-tab-item-active"
@@ -835,7 +839,7 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
                             // The mutation re-renders the tab elsewhere in the
                             // tree; without this the keyboard flow strands
                             // focus on <body>.
-                            dom::focus_after_render(tab_dom_id(&key_id));
+                            dom::focus_after_render(dom_ids.tab(&key_id));
                         }
                         return;
                     }
@@ -853,7 +857,7 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
                     let target = tab_order[target].clone();
                     mutate_layout(shared, |layout| layout.activate(&target));
                     shared.on_panel_activate.call(target.clone());
-                    dom::focus_after_render(tab_dom_id(&target));
+                    dom::focus_after_render(dom_ids.tab(&target));
                 },
                 if let Some(icon) = panel.tab_icon.clone() {
                     span { class: "wb-tab-icon", "aria-hidden": "true", {icon} }
@@ -1027,10 +1031,94 @@ fn safe_id(value: &str) -> String {
         .collect()
 }
 
-fn tab_dom_id(panel: &PanelId) -> String {
-    format!("wb-tab-{}", safe_id(panel.as_str()))
+/// Logical panel and layout IDs are local to a workspace. DOM IDs must also
+/// identify the owning instance so retained or side-by-side workspaces cannot
+/// redirect each other's focus, pointer capture, or splitter updates.
+#[derive(Clone, Copy)]
+struct WorkspaceDomIds {
+    scope: ScopeId,
 }
 
-fn panel_dom_id(panel: &PanelId) -> String {
-    format!("wb-panel-{}", safe_id(panel.as_str()))
+impl WorkspaceDomIds {
+    fn new() -> Self {
+        Self {
+            scope: dioxus::dioxus_core::current_scope_id(),
+        }
+    }
+
+    fn element(self, kind: &str, key: &str) -> String {
+        format!("wb-{}-{kind}-{}", self.scope.0, safe_id(key))
+    }
+
+    fn tab(self, panel: &PanelId) -> String {
+        self.element("tab", panel.as_str())
+    }
+
+    fn panel(self, panel: &PanelId) -> String {
+        self.element("panel", panel.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus::dioxus_core::{AttributeValue, Mutation};
+
+    struct WorkspacePair;
+    impl WorkspacePair {
+        fn render() -> Element {
+            rsx! {
+                for instance in ["first", "second"] {
+                    PanelWorkspace {
+                        key: "{instance}",
+                        // All logical IDs intentionally overlap across instances.
+                        panels: vec![
+                            Panel::new("scene", "Scene", "primary", rsx! { "Scene content" }),
+                            Panel::new("details", "Details", "secondary", rsx! { "Details content" }),
+                        ],
+                        initial_layout: PanelLayout::new(LayoutNode::split(
+                            "columns", SplitAxis::Horizontal, 0.5,
+                            LayoutNode::tile("primary", ["scene".to_owned()]),
+                            LayoutNode::tile("secondary", ["details".to_owned()]),
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mounted_workspaces_have_distinct_dom_ids_and_local_aria_targets() {
+        let mut dom = VirtualDom::new(WorkspacePair::render);
+        let mutations = dom.rebuild_to_vec();
+        let mut ids = HashSet::new();
+        let mut references = Vec::new();
+        let mut elements = HashMap::new();
+        for edit in mutations.edits {
+            if let Mutation::SetAttribute {
+                name,
+                value: AttributeValue::Text(value),
+                id,
+                ..
+            } = edit
+            {
+                if name == "id" {
+                    assert!(ids.insert(value.clone()), "duplicate DOM id: {value}");
+                    elements.insert(id, value);
+                } else if matches!(name, "aria-controls" | "aria-labelledby") {
+                    references.push((id, value));
+                }
+            }
+        }
+        assert_eq!(ids.iter().filter(|id| id.contains("-splitter-")).count(), 2);
+        assert_eq!(ids.iter().filter(|id| id.contains("-tabs-")).count(), 4);
+        assert_eq!(ids.iter().filter(|id| id.contains("-tab-")).count(), 4);
+        assert_eq!(ids.iter().filter(|id| id.contains("-panel-")).count(), 4);
+        assert_eq!(references.len(), 8);
+        for (element, target) in references {
+            assert!(ids.contains(&target), "missing ARIA target: {target}");
+            let owner = elements[&element].split('-').nth(1).unwrap();
+            assert_eq!(target.split('-').nth(1).unwrap(), owner);
+        }
+    }
 }
