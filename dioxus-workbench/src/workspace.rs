@@ -467,6 +467,24 @@ pub fn PanelWorkspace(
         .iter()
         .filter(|panel| seen.insert(panel.id.clone()))
         .cloned()
+        .map(|panel| {
+            let tile = display.tile_for_panel(&panel.id);
+            let active = tile
+                .as_ref()
+                .and_then(|id| display.tile(id))
+                .is_some_and(|tile| tile.active.as_ref() == Some(&panel.id));
+            let layout_identity = tile
+                .as_ref()
+                .and_then(|id| display.root.tile_path(id))
+                .unwrap_or_default();
+            let close_id = panel.id.clone();
+            let closable = panel.closable;
+            // Keep the key on each sibling VNode, not inside an unkeyed wrapper.
+            rsx! { PanelHost { key: "{panel.id}", panel, tile, active,
+                on_close: move |_| if closable { shared.request_close(close_id.clone()); },
+                layout_identity,
+            } }
+        })
         .collect::<Vec<_>>();
     let display_tile_count = display.tile_count();
     let resizing_active = resizing().is_some();
@@ -521,19 +539,7 @@ pub fn PanelWorkspace(
                 drop_preview.set(None);
             },
             NodeView { node: display.root.clone(), panels, display_tile_count }
-            for panel in hosts {
-                {
-                    let tile = display.tile_for_panel(&panel.id);
-                    let active = tile.as_ref().and_then(|id| display.tile(id)).is_some_and(|tile| tile.active.as_ref() == Some(&panel.id));
-                    let layout_identity = tile.as_ref().and_then(|id| display.root.tile_path(id)).unwrap_or_default();
-                    let close_id = panel.id.clone();
-                    let closable = panel.closable;
-                    rsx! { PanelHost { key: "{panel.id}", panel, tile, active,
-                        on_close: move |_| if closable { shared.request_close(close_id.clone()); },
-                        layout_identity,
-                    } }
-                }
-            }
+            {hosts.into_iter()}
         }
     }
 }
@@ -1254,6 +1260,7 @@ mod tests {
         layout: Rc<RefCell<Option<Signal<PanelLayout>>>>,
         editor: RetainedEditor,
         present: Rc<RefCell<Option<Signal<bool>>>>,
+        leading: Rc<RefCell<Option<Signal<bool>>>>,
     }
     #[component]
     fn RetainedEditorPanel(fixture: RetainedEditor) -> Element {
@@ -1267,6 +1274,8 @@ mod tests {
             *self.layout.borrow_mut() = Some(layout);
             let present = use_signal(|| true);
             *self.present.borrow_mut() = Some(present);
+            let leading = use_signal(|| true);
+            *self.leading.borrow_mut() = Some(leading);
             let mut panels = vec![Panel::new("other", "Other", "main", rsx! { "other" })];
             if present() {
                 panels.insert(
@@ -1279,6 +1288,9 @@ mod tests {
                     ),
                 );
             }
+            if leading() {
+                panels.insert(0, Panel::new("camera", "Camera", "main", rsx! { "camera" }));
+            }
             rsx! { PanelWorkspace { layout, panels } }
         }
     }
@@ -1288,6 +1300,7 @@ mod tests {
         let fixture = DockingHarness {
             layout: Rc::new(RefCell::new(None)),
             present: Rc::new(RefCell::new(None)),
+            leading: Rc::new(RefCell::new(None)),
             editor: RetainedEditor {
                 mounts: Rc::new(Cell::new(0)),
                 drops: Rc::new(Cell::new(0)),
@@ -1313,6 +1326,16 @@ mod tests {
             });
             dom.render_immediate_to_vec();
             assert_eq!(fixture.editor.mounts.get(), 1);
+            assert_eq!(&*draft.peek(), "unsaved SQL");
+        }
+        // Removing/reinserting an earlier sibling must preserve the later host.
+        let mut leading = fixture.leading.borrow().unwrap();
+        for visible in [false, true, false, true] {
+            dom.in_runtime(|| leading.set(visible));
+            dom.render_immediate_to_vec();
+            assert_eq!(fixture.editor.mounts.get(), 1);
+            assert_eq!(fixture.editor.drops.get(), 0);
+            assert_eq!(fixture.editor.draft.borrow().unwrap(), draft);
             assert_eq!(&*draft.peek(), "unsaved SQL");
         }
         let mut present = fixture.present.borrow().unwrap();
