@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 use crate::dom;
 use crate::icons::{CloseIcon, DockCompassIcon, SplitDownIcon, SplitRightIcon};
 use crate::model::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO};
+use crate::panel_host::PanelHost;
 use crate::strings::WorkbenchStrings;
 use crate::style::{use_style_owner, WorkbenchStyle};
 use crate::{
@@ -15,6 +16,22 @@ use crate::{
 
 const RESIZE_KEYBOARD_STEP: f64 = 0.025;
 const RESIZE_KEYBOARD_LARGE_STEP: f64 = 0.08;
+
+/// The current destination of a group toolbar. Its content stays app-owned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupContext {
+    tile: TileId,
+    active_panel: Option<PanelId>,
+}
+
+impl GroupContext {
+    pub fn tile(&self) -> &TileId {
+        &self.tile
+    }
+    pub fn active_panel(&self) -> Option<&PanelId> {
+        self.active_panel.as_ref()
+    }
+}
 
 /// Application content registered with a [`PanelWorkspace`].
 #[derive(Clone, PartialEq)]
@@ -130,10 +147,12 @@ struct ResizeDrag {
 /// and event handlers are `Copy`, so subscribing components pay only for what
 /// they actually read. Render code must not read `placements` or
 /// `reset_layout` — they exist for event handlers, which `peek` them.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct WorkspaceShared {
     layout: Signal<PanelLayout>,
+    dom_ids: WorkspaceDomIds,
     placements: Signal<Vec<PanelPlacement>>,
+    pending_closes: Signal<Vec<PanelId>>,
     reset_layout: Signal<PanelLayout>,
     strings: Signal<WorkbenchStrings>,
     dragging: Signal<Option<PanelId>>,
@@ -145,6 +164,67 @@ struct WorkspaceShared {
     on_panel_close: EventHandler<PanelId>,
     on_resize: EventHandler<()>,
     on_tab_menu: Option<EventHandler<TabMenuRequest>>,
+    group_toolbar: Option<Callback<GroupContext, Element>>,
+}
+
+impl WorkspaceShared {
+    fn request_close(self, panel: PanelId) {
+        let mut pending = self.pending_closes;
+        if !pending.peek().contains(&panel) {
+            pending.write().push(panel.clone());
+        }
+        self.on_panel_close.call(panel);
+    }
+
+    fn reconcile_closed_panels(self, placements: &[PanelPlacement]) {
+        let available = placements
+            .iter()
+            .map(|placement| &placement.panel)
+            .collect::<HashSet<_>>();
+        let mut pending = self.pending_closes;
+        let confirmed = pending
+            .peek()
+            .iter()
+            .filter(|id| !available.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if confirmed.is_empty() {
+            return;
+        }
+        pending.write().retain(|id| available.contains(id));
+        let previous = self.layout.peek().clone();
+        let mut next = previous.clone();
+        let mut last_close = None;
+        for panel in confirmed {
+            if let Some(outcome) = next.close_panel(&panel) {
+                last_close = Some(outcome);
+            }
+        }
+        next.reconcile(placements);
+        let destination = last_close
+            .as_ref()
+            .and_then(|outcome| previous.focus_tile_after_close(outcome.tile(), &next))
+            .cloned();
+        let mut layout = self.layout;
+        if next != previous {
+            layout.set(next.clone());
+            self.on_layout_change.call(next);
+            self.on_resize.call(());
+        }
+        if let Some(tile) = destination {
+            if last_close.is_some_and(|outcome| outcome.was_active()) {
+                if let Some(target) = &tile.active {
+                    self.on_panel_activate.call(target.clone());
+                }
+            }
+            let target = tile
+                .active
+                .as_ref()
+                .map(|id| self.dom_ids.tab(id))
+                .unwrap_or_else(|| self.dom_ids.element("tabs", tile.id.as_str()));
+            dom::focus_after_render(target);
+        }
+    }
 }
 
 /// Render a session-owned tree of tabbed panels and resizable splits.
@@ -208,7 +288,8 @@ pub fn PanelWorkspace(
     on_layout_change: EventHandler<PanelLayout>,
     #[props(default)] on_panel_activate: EventHandler<PanelId>,
     /// Fired when a closable panel's close affordance is used. The
-    /// application removes the panel from `panels` to complete the close.
+    /// application removes the panel from `panels` to approve (immediately or
+    /// after confirmation). Keeping it registered leaves layout and focus alone.
     #[props(default)]
     on_panel_close: EventHandler<PanelId>,
     /// Fired when panel geometry settles (a dock, a finished resize), for
@@ -221,13 +302,16 @@ pub fn PanelWorkspace(
     /// position. Absent, tabs keep the native menu.
     #[props(default)]
     on_tab_menu: Option<EventHandler<TabMenuRequest>>,
+    /// Content beside each group's tabs. The workspace owns sizing and placement.
+    #[props(default)]
+    group_toolbar: Option<Callback<GroupContext, Element>>,
     /// Overrides for the chrome's own text — see [`WorkbenchStrings`].
     #[props(default)]
     strings: Option<WorkbenchStrings>,
 ) -> Element {
     let owns_style = use_style_owner();
     let placements = panels.iter().map(Panel::placement).collect::<Vec<_>>();
-    use_context_provider(WorkspaceDomIds::new);
+    let dom_ids = use_context_provider(WorkspaceDomIds::new);
     // With no explicit first arrangement, derive one from panel homes.
     let resolved_initial = initial_layout.unwrap_or_else(|| PanelLayout::from_homes(&placements));
     let initial_placements = placements.clone();
@@ -242,6 +326,7 @@ pub fn PanelWorkspace(
     let mut dragging = use_signal(|| None::<PanelId>);
     let mut drop_preview = use_signal(|| None::<DropPreview>);
     let mut resizing = use_signal(|| None::<ResizeDrag>);
+    let mut pending_closes = use_signal(Vec::<PanelId>::new);
     let split_mounts = use_signal(HashMap::<SplitId, Rc<MountedData>>::new);
     let resolved_reset = reset_layout.unwrap_or_else(|| resolved_initial.clone());
     let resolved_strings = strings.unwrap_or_default();
@@ -260,7 +345,9 @@ pub fn PanelWorkspace(
 
     let shared = use_context_provider(|| WorkspaceShared {
         layout,
+        dom_ids,
         placements: placements_mirror,
+        pending_closes,
         reset_layout: reset_mirror,
         strings: strings_mirror,
         dragging,
@@ -272,6 +359,7 @@ pub fn PanelWorkspace(
         on_panel_close,
         on_resize,
         on_tab_menu,
+        group_toolbar,
     });
 
     // Registrations that cannot render are repaired silently; say so once at
@@ -293,6 +381,7 @@ pub fn PanelWorkspace(
             let mut strings_mirror = strings_mirror;
             if *placements_mirror.peek() != placements {
                 warn_duplicate_panels(&placements);
+                shared.reconcile_closed_panels(&placements);
                 placements_mirror.set(placements);
             }
             if *reset_mirror.peek() != reset {
@@ -318,6 +407,7 @@ pub fn PanelWorkspace(
             return;
         }
         let next = layout_for_registry(next_fallback.clone(), &next_placements);
+        pending_closes.clear();
         current_layout_scope.set(next_scope.clone());
         layout.set(next);
         dragging.set(None);
@@ -371,6 +461,13 @@ pub fn PanelWorkspace(
     }));
 
     let display = display_layout();
+    let dom_ids = use_context::<WorkspaceDomIds>();
+    let mut seen = HashSet::new();
+    let hosts = panels
+        .iter()
+        .filter(|panel| seen.insert(panel.id.clone()))
+        .cloned()
+        .collect::<Vec<_>>();
     let display_tile_count = display.tile_count();
     let resizing_active = resizing().is_some();
     let dragging_active = dragging().is_some();
@@ -380,6 +477,7 @@ pub fn PanelWorkspace(
             WorkbenchStyle {}
         }
         section {
+            id: dom_ids.element("workspace", "root"),
             class: "wb-workspace",
             "data-resizing": resizing_active,
             "data-dragging": dragging_active,
@@ -422,7 +520,20 @@ pub fn PanelWorkspace(
                 dragging.set(None);
                 drop_preview.set(None);
             },
-            NodeView { node: display.root, panels, display_tile_count }
+            NodeView { node: display.root.clone(), panels, display_tile_count }
+            for panel in hosts {
+                {
+                    let tile = display.tile_for_panel(&panel.id);
+                    let active = tile.as_ref().and_then(|id| display.tile(id)).is_some_and(|tile| tile.active.as_ref() == Some(&panel.id));
+                    let layout_identity = tile.as_ref().and_then(|id| display.root.tile_path(id)).unwrap_or_default();
+                    let close_id = panel.id.clone();
+                    let closable = panel.closable;
+                    rsx! { PanelHost { key: "{panel.id}", panel, tile, active,
+                        on_close: move |_| if closable { shared.request_close(close_id.clone()); },
+                        layout_identity,
+                    } }
+                }
+            }
         }
     }
 }
@@ -623,6 +734,7 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
     let close_tile = tile.id.clone();
     let tabs_dom_id = dom_ids.element("tabs", tile.id.as_str());
     let wheel_tabs_dom_id = tabs_dom_id.clone();
+    let keyboard_panel = tile.active.clone();
     // Name each tab strip after its active panel, so assistive technology
     // can tell four "Panel group"s apart.
     let group_label = tile
@@ -639,7 +751,17 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
                     id: "{tabs_dom_id}",
                     class: "wb-tabs",
                     role: "tablist",
+                    tabindex: "-1",
                     "aria-label": "{group_label}",
+                    onkeydown: move |event: KeyboardEvent| {
+                        if event.key() == Key::Tab && event.modifiers().is_empty() {
+                            if let Some(panel) = &keyboard_panel {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                dom::focus_after_render(dom_ids.panel(panel));
+                            }
+                        }
+                    },
                     // A vertical wheel walks an overflowed strip sideways,
                     // the way editors train. Harmless when nothing overflows.
                     onwheel: move |event| {
@@ -705,29 +827,13 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
                         }
                     }
                 }
-            }
-            div { class: "wb-panel-frame",
-                for panel_id in &tile.panels {
-                    if let Some(panel) = panels.iter().find(|panel| &panel.id == panel_id) {
-                        {
-                            let is_active = tile.active.as_ref() == Some(&panel.id);
-                            let panel_dom = dom_ids.panel(&panel.id);
-                            let labelled_by = dom_ids.tab(&panel.id);
-                            rsx! {
-                                div {
-                                    key: "{panel.id}",
-                                    id: "{panel_dom}",
-                                    class: "wb-panel-content {panel.class}",
-                                    role: "tabpanel",
-                                    tabindex: "0",
-                                    hidden: !is_active,
-                                    "aria-labelledby": "{labelled_by}",
-                                    {panel.content.clone()}
-                                }
-                            }
-                        }
+                if let Some(toolbar) = shared.group_toolbar {
+                    div { class: "wb-group-toolbar",
+                        {toolbar.call(GroupContext { tile: tile.id.clone(), active_panel: tile.active.clone() })}
                     }
                 }
+            }
+            div { class: "wb-panel-frame", id: dom_ids.element("content-slot", tile.id.as_str()),
                 if tile.panels.is_empty() {
                     div { class: "wb-empty-tile",
                         strong { "{strings.empty_tile_title}" }
@@ -843,6 +949,11 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
                         }
                         return;
                     }
+                    if event.key() == Key::Delete && panel.closable {
+                        event.prevent_default();
+                        shared.request_close(key_id.clone());
+                        return;
+                    }
                     let Some(current) = tab_order.iter().position(|panel| panel == &key_id) else {
                         return;
                     };
@@ -873,7 +984,7 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
                     class: "wb-tab-close wb-icon-btn wb-hover-action",
                     "aria-label": "{close_label}",
                     title: "{close_label}",
-                    onclick: move |_| shared.on_panel_close.call(close_id.clone()),
+                    onclick: move |_| shared.request_close(close_id.clone()),
                     CloseIcon {}
                 }
             }
@@ -1034,8 +1145,8 @@ fn safe_id(value: &str) -> String {
 /// Logical panel and layout IDs are local to a workspace. DOM IDs must also
 /// identify the owning instance so retained or side-by-side workspaces cannot
 /// redirect each other's focus, pointer capture, or splitter updates.
-#[derive(Clone, Copy)]
-struct WorkspaceDomIds {
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct WorkspaceDomIds {
     scope: ScopeId,
 }
 
@@ -1046,15 +1157,15 @@ impl WorkspaceDomIds {
         }
     }
 
-    fn element(self, kind: &str, key: &str) -> String {
+    pub(crate) fn element(self, kind: &str, key: &str) -> String {
         format!("wb-{}-{kind}-{}", self.scope.0, safe_id(key))
     }
 
-    fn tab(self, panel: &PanelId) -> String {
+    pub(crate) fn tab(self, panel: &PanelId) -> String {
         self.element("tab", panel.as_str())
     }
 
-    fn panel(self, panel: &PanelId) -> String {
+    pub(crate) fn panel(self, panel: &PanelId) -> String {
         self.element("panel", panel.as_str())
     }
 }
@@ -1063,6 +1174,156 @@ impl WorkspaceDomIds {
 mod tests {
     use super::*;
     use dioxus::dioxus_core::{AttributeValue, Mutation};
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Clone)]
+    struct ClosingHarness {
+        shared: Rc<RefCell<Option<WorkspaceShared>>>,
+        requested: Rc<RefCell<Vec<PanelId>>>,
+    }
+
+    #[component]
+    fn ClosingProbe(shared: Rc<RefCell<Option<WorkspaceShared>>>) -> Element {
+        *shared.borrow_mut() = Some(use_context::<WorkspaceShared>());
+        VNode::empty()
+    }
+
+    impl ClosingHarness {
+        fn render(self) -> Element {
+            rsx! { PanelWorkspace {
+                panels: vec![
+                    Panel::new("first", "First", "main", rsx! { ClosingProbe { shared: self.shared } }).with_closable(true),
+                    Panel::new("second", "Second", "main", VNode::empty()),
+                ],
+                on_panel_close: move |panel| self.requested.borrow_mut().push(panel),
+            } }
+        }
+    }
+
+    #[test]
+    fn close_callback_waits_for_registry_removal_without_acceptance_api() {
+        let fixture = ClosingHarness {
+            shared: Rc::new(RefCell::new(None)),
+            requested: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut dom = VirtualDom::new_with_props(ClosingHarness::render, fixture.clone());
+        dom.rebuild_in_place();
+        let shared = fixture.shared.borrow().unwrap();
+        dom.in_runtime(|| {
+            shared.request_close("first".into());
+            assert_eq!(&*fixture.requested.borrow(), &[PanelId::from("first")]);
+            let unchanged = shared.layout.peek().clone();
+            shared.reconcile_closed_panels(&[
+                PanelPlacement::new("first", "main"),
+                PanelPlacement::new("second", "main"),
+            ]);
+            assert_eq!(*shared.layout.peek(), unchanged);
+            // Confirm later by removing the registration; no second app call.
+            shared.reconcile_closed_panels(&[PanelPlacement::new("second", "main")]);
+            assert!(shared
+                .layout
+                .peek()
+                .tile_for_panel(&"first".into())
+                .is_none());
+            assert_eq!(
+                shared.layout.peek().tile(&"main".into()).unwrap().active,
+                Some("second".into())
+            );
+            assert!(shared.pending_closes.peek().is_empty());
+        });
+    }
+
+    #[derive(Clone, PartialEq)]
+    struct RetainedEditor {
+        mounts: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+        draft: Rc<RefCell<Option<Signal<String>>>>,
+    }
+    impl RetainedEditor {
+        fn render(self) -> Element {
+            use_hook(|| self.mounts.set(self.mounts.get() + 1));
+            use_drop(move || self.drops.set(self.drops.get() + 1));
+            let draft = use_signal(|| "original".to_owned());
+            *self.draft.borrow_mut() = Some(draft);
+            rsx! { input { value: "{draft}" } }
+        }
+    }
+
+    #[derive(Clone)]
+    struct DockingHarness {
+        layout: Rc<RefCell<Option<Signal<PanelLayout>>>>,
+        editor: RetainedEditor,
+        present: Rc<RefCell<Option<Signal<bool>>>>,
+    }
+    #[component]
+    fn RetainedEditorPanel(fixture: RetainedEditor) -> Element {
+        fixture.render()
+    }
+
+    impl DockingHarness {
+        fn render(self) -> Element {
+            let layout =
+                use_signal(|| PanelLayout::new(LayoutNode::tile("main", ["editor", "other"])));
+            *self.layout.borrow_mut() = Some(layout);
+            let present = use_signal(|| true);
+            *self.present.borrow_mut() = Some(present);
+            let mut panels = vec![Panel::new("other", "Other", "main", rsx! { "other" })];
+            if present() {
+                panels.insert(
+                    0,
+                    Panel::new(
+                        "editor",
+                        "Editor",
+                        "main",
+                        rsx! { RetainedEditorPanel { fixture: self.editor } },
+                    ),
+                );
+            }
+            rsx! { PanelWorkspace { layout, panels } }
+        }
+    }
+
+    #[test]
+    fn structural_docking_preserves_panel_component_and_draft() {
+        let fixture = DockingHarness {
+            layout: Rc::new(RefCell::new(None)),
+            present: Rc::new(RefCell::new(None)),
+            editor: RetainedEditor {
+                mounts: Rc::new(Cell::new(0)),
+                drops: Rc::new(Cell::new(0)),
+                draft: Rc::new(RefCell::new(None)),
+            },
+        };
+        let mut dom = VirtualDom::new_with_props(DockingHarness::render, fixture.clone());
+        dom.rebuild_in_place();
+        let mut layout = fixture.layout.borrow().unwrap();
+        let mut draft = fixture.editor.draft.borrow().unwrap();
+        dom.in_runtime(|| draft.set("unsaved SQL".into()));
+        dom.render_immediate_to_vec();
+        for zone in [
+            DockZone::Right,
+            DockZone::Center,
+            DockZone::Bottom,
+            DockZone::Center,
+        ] {
+            dom.in_runtime(|| {
+                layout
+                    .write()
+                    .dock_panel(&PanelId::from("editor"), &TileId::from("main"), zone);
+            });
+            dom.render_immediate_to_vec();
+            assert_eq!(fixture.editor.mounts.get(), 1);
+            assert_eq!(&*draft.peek(), "unsaved SQL");
+        }
+        let mut present = fixture.present.borrow().unwrap();
+        dom.in_runtime(|| present.set(false));
+        dom.render_immediate_to_vec();
+        assert_eq!(fixture.editor.drops.get(), 1);
+        dom.in_runtime(|| present.set(true));
+        dom.render_immediate_to_vec();
+        assert_eq!(fixture.editor.mounts.get(), 2);
+        assert_eq!(&*fixture.editor.draft.borrow().unwrap().peek(), "original");
+    }
 
     struct WorkspacePair;
     impl WorkspacePair {

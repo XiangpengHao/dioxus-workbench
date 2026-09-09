@@ -184,6 +184,23 @@ pub struct Tile {
 }
 
 impl Tile {
+    fn close_panel(&mut self, panel: &PanelId) -> Option<PanelCloseOutcome> {
+        let index = self.panels.iter().position(|id| id == panel)?;
+        let was_active = self.active.as_ref() == Some(panel);
+        self.panels.remove(index);
+        if was_active {
+            self.active = self
+                .panels
+                .get(index)
+                .or_else(|| self.panels.last())
+                .cloned();
+        }
+        Some(PanelCloseOutcome {
+            tile: self.id.clone(),
+            active_panel: self.active.clone(),
+            was_active,
+        })
+    }
     pub fn new<I, P>(id: impl Into<TileId>, panels: I) -> Self
     where
         I: IntoIterator<Item = P>,
@@ -206,6 +223,26 @@ impl Tile {
     }
 }
 
+/// The selection left in a group after removing a panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelCloseOutcome {
+    tile: TileId,
+    active_panel: Option<PanelId>,
+    was_active: bool,
+}
+
+impl PanelCloseOutcome {
+    pub fn tile(&self) -> &TileId {
+        &self.tile
+    }
+    pub fn active_panel(&self) -> Option<&PanelId> {
+        self.active_panel.as_ref()
+    }
+    pub fn was_active(&self) -> bool {
+        self.was_active
+    }
+}
+
 /// The recursive tiling tree. Ratios describe the first child's share.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -221,6 +258,53 @@ pub enum LayoutNode {
 }
 
 impl LayoutNode {
+    fn surviving_tile<'a>(&self, next: &'a PanelLayout) -> Option<&'a Tile> {
+        match self {
+            Self::Tile(tile) => next.tile(&tile.id),
+            Self::Split { first, second, .. } => first
+                .surviving_tile(next)
+                .or_else(|| second.surviving_tile(next)),
+        }
+    }
+
+    fn inheriting_tile<'a>(&self, closing: &TileId, next: &'a PanelLayout) -> Option<&'a Tile> {
+        if let Some(tile) = next.tile(closing) {
+            return Some(tile);
+        }
+        match self {
+            Self::Tile(_) => None,
+            Self::Split { first, second, .. } if contains_tile(first, closing) => first
+                .inheriting_tile(closing, next)
+                .or_else(|| second.surviving_tile(next)),
+            Self::Split { first, second, .. } => second
+                .inheriting_tile(closing, next)
+                .or_else(|| first.surviving_tile(next)),
+        }
+    }
+    pub(crate) fn tile_path(&self, tile: &TileId) -> Option<Vec<(SplitId, bool)>> {
+        match self {
+            Self::Tile(leaf) => (leaf.id == *tile).then(Vec::new),
+            Self::Split {
+                id, first, second, ..
+            } => {
+                let (mut path, is_first) = if let Some(path) = first.tile_path(tile) {
+                    (path, true)
+                } else {
+                    (second.tile_path(tile)?, false)
+                };
+                path.insert(0, (id.clone(), is_first));
+                Some(path)
+            }
+        }
+    }
+    fn close_panel(&mut self, panel: &PanelId) -> Option<PanelCloseOutcome> {
+        match self {
+            Self::Tile(tile) => tile.close_panel(panel),
+            Self::Split { first, second, .. } => first
+                .close_panel(panel)
+                .or_else(|| second.close_panel(panel)),
+        }
+    }
     pub fn tile<I, P>(id: impl Into<TileId>, panels: I) -> Self
     where
         I: IntoIterator<Item = P>,
@@ -286,6 +370,21 @@ pub struct PanelLayout {
 }
 
 impl PanelLayout {
+    pub(crate) fn focus_tile_after_close<'a>(
+        &self,
+        closing: &TileId,
+        next: &'a Self,
+    ) -> Option<&'a Tile> {
+        self.root
+            .inheriting_tile(closing, next)
+            .or_else(|| next.tile(first_tile_id(&next.root)))
+    }
+    /// Remove a panel using its actual group order. Active closes prefer the
+    /// right neighbor, then the left. Inactive closes preserve selection.
+    /// Empty groups remain until registry reconciliation applies home policy.
+    pub fn close_panel(&mut self, panel: &PanelId) -> Option<PanelCloseOutcome> {
+        self.root.close_panel(panel)
+    }
     pub fn new(root: LayoutNode) -> Self {
         Self {
             version: LAYOUT_VERSION,
@@ -945,6 +1044,73 @@ fn collect_split_ids(node: &LayoutNode, ids: &mut Vec<SplitId>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closing_a_pruned_group_focuses_its_inheriting_sibling() {
+        let previous = super::PanelLayout::new(super::LayoutNode::split(
+            "outer",
+            super::SplitAxis::Horizontal,
+            0.3,
+            super::LayoutNode::tile("unrelated", ["files"]),
+            super::LayoutNode::split(
+                "inner",
+                super::SplitAxis::Vertical,
+                0.5,
+                super::LayoutNode::tile("main", ["editor"]),
+                super::LayoutNode::tile("detached", ["terminal"]),
+            ),
+        ));
+        let mut next = previous.clone();
+        let closed = next.close_panel(&"terminal".into()).unwrap();
+        next.reconcile(&[
+            super::PanelPlacement::new("files", "unrelated"),
+            super::PanelPlacement::new("editor", "main"),
+        ]);
+        assert!(next.tile(&"detached".into()).is_none());
+        let target = previous
+            .focus_tile_after_close(closed.tile(), &next)
+            .unwrap();
+        assert_eq!(target.id, "main".into());
+        assert_eq!(target.active, Some("editor".into()));
+    }
+
+    #[test]
+    fn closing_the_entire_registry_has_a_real_empty_group_focus_target() {
+        let previous = super::PanelLayout::single("main", "editor");
+        let mut next = previous.clone();
+        let closed = next.close_panel(&"editor".into()).unwrap();
+        next.reconcile(&[]);
+        let target = previous
+            .focus_tile_after_close(closed.tile(), &next)
+            .unwrap();
+        assert!(next.tile(&target.id).is_some());
+        assert!(target.active.is_none());
+    }
+    #[test]
+    fn closing_uses_docked_group_order_and_preserves_inactive_selection() {
+        let mut layout = super::PanelLayout::new(super::LayoutNode::split(
+            "columns",
+            super::SplitAxis::Horizontal,
+            0.5,
+            super::LayoutNode::tile("left", ["a", "b"]),
+            super::LayoutNode::tile("right", ["c", "d"]),
+        ));
+        layout.dock_panel(&"b".into(), &"right".into(), super::DockZone::Center);
+        layout.activate(&"d".into());
+        let inactive = layout.close_panel(&"c".into()).unwrap();
+        assert!(!inactive.was_active());
+        assert_eq!(inactive.active_panel(), Some(&"d".into()));
+        let selected = layout.close_panel(&"d".into()).unwrap();
+        assert_eq!(selected.tile(), &"right".into());
+        assert_eq!(selected.active_panel(), Some(&"b".into()));
+        assert!(selected.was_active());
+        let last = layout.close_panel(&"b".into()).unwrap();
+        assert!(last.active_panel().is_none());
+        assert!(layout.close_panel(&"b".into()).is_none());
+        assert_eq!(
+            layout.tile(&"left".into()).unwrap().active,
+            Some("a".into())
+        );
+    }
     use super::*;
 
     fn two_tiles() -> PanelLayout {

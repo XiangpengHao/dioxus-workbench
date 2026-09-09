@@ -92,7 +92,7 @@ pub fn focus_after_render(id: impl Into<String>) {
         for attempt in 0..16 {
             sleep_ms(if attempt == 0 { 0 } else { 16 }).await;
             let script = format!(
-                "const el = document.getElementById({id}); if (el) el.focus(); return el !== null;",
+                "const el = document.getElementById({id}); if (el) el.focus(); return el !== null && document.activeElement === el;",
                 id = js_string(&id),
             );
             match document::eval(&script).await {
@@ -102,6 +102,27 @@ pub fn focus_after_render(id: impl Into<String>) {
                 Err(_) => break,
             }
         }
+    });
+}
+
+/// A host is outside its tab's DOM subtree. Bridge reverse Tab only when
+/// the host itself owns focus; descendants keep their normal keyboard order.
+pub(crate) fn bridge_panel_tab(panel: &str, tab: &str) {
+    let script = format!(
+        "const host = document.getElementById({panel});\n\
+         if (host) host.addEventListener('keydown', event => {{\n\
+             if (event.target === host && event.key === 'Tab' && event.shiftKey &&\n\
+                 !event.altKey && !event.ctrlKey && !event.metaKey) {{\n\
+                 const tab = document.getElementById({tab});\n\
+                 if (tab) {{ event.preventDefault(); event.stopPropagation(); tab.focus(); }}\n\
+             }}\n\
+         }});",
+        panel = js_string(panel),
+        tab = js_string(tab),
+    );
+    dioxus::dioxus_core::spawn_forever(async move {
+        sleep_ms(0).await;
+        let _ = document::eval(&script).await;
     });
 }
 

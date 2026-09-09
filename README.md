@@ -162,7 +162,11 @@ persists one layout per activity this way.
 
 The `panels` prop is the registry: render it from state and panels come and go
 at runtime. `.with_closable(true)` gives a tab a close affordance; handle
-`on_panel_close` by removing the panel from your registry.
+`on_panel_close(PanelId)` by removing the panel from your registry.
+Keeping the panel registered leaves selection and focus unchanged. Removal completes
+the close, including after asynchronous confirmation. Workbench chooses
+the right neighbor, then the left, in the panel's actual group. If reconciliation
+prunes that group, focus moves to the active tab of the group inheriting its space.
 
 `active_panel` brings a tab to the front programmatically — a notification's
 "show me" action. It is edge-triggered with memory: it applies once when the
@@ -172,14 +176,58 @@ same panel twice.
 
 ## Panel state
 
-Panel content stays mounted while tabs switch within a group — scroll
-positions, form values, and internal signals survive activation. A
-*structural* move is different: docking a panel into another group, or an edge
-split replacing a tile, rebuilds that region of the element tree and remounts
-the panels involved. State that must survive docking belongs outside the panel
-— a signal owned by the application, a context, or a store its content reads.
-The demo's Query panel keeps its text in a `GlobalSignal` for exactly this
-reason: drag its tab into another group and the edited text comes along.
+Panel content lives in a stable host keyed by panel ID. Tab switches, structural
+docks, and splits preserve component signals, form values, and scroll positions.
+Removing a panel from the registry unmounts it. Reopening creates fresh state.
+Keep IDs unique and keep the content component type stable for this guarantee.
+
+The recursive chrome tree contains measured content slots; stable hosts follow
+those slots without reparenting application DOM. Measurements use Dioxus's
+`document::eval` bridge and ResizeObserver on both web and desktop, with no
+web-sys dependency. Observers reconnect after structural moves and disconnect
+when hidden or removed. This requires a document-capable renderer.
+
+### Panel lifecycle
+
+Inside panel content, `PanelContext::current()` provides reactive geometry:
+
+```rust,ignore
+let panel = PanelContext::current();
+use_effect(move || {
+    let box_size = panel.geometry();
+    if box_size.visible() {
+        // Resize your renderer using box_size.width() / box_size.height().
+    }
+});
+```
+
+Dimensions are CSS pixels for the panel's content area. Invisible panels report
+zero dimensions. Updates cover ancestor visibility, tab activation, window
+resizing, and live splitter drags. Nested charts can still observe their own
+smaller element boxes; the panel does not dictate their internal arrangement.
+`panel.request_close()` uses the same application acceptance path as the tab's
+close control. Closing remains an application decision.
+
+### Group toolbar
+
+`group_toolbar` accepts a callback from `GroupContext` to `Element`. The context
+exposes `tile()` and `active_panel()`. It is rendered beside the native tab strip;
+workbench owns its sizing, overflow, and placement when groups are docked.
+Return an empty element for groups without actions. Toolbar content belongs to
+the group chrome and may remount during docking; keep durable state in the panel
+or application, not inside a toolbar control.
+
+```rust,ignore
+PanelWorkspace {
+    panels,
+    group_toolbar: move |group: GroupContext| rsx! {
+        button { onclick: move |_| open_for(group.tile()), "Load" }
+    },
+    on_panel_close: move |closing: PanelId| {
+        opened.write().retain(|panel| panel.id != closing);
+    },
+}
+```
 
 ## Runtime control
 
@@ -261,7 +309,7 @@ is exported as `dioxus_workbench::STYLESHEET`.
 | --- | --- |
 | `on_layout_change` | a settled layout mutation — dock, split, activation, finished resize — with the full serializable layout |
 | `on_panel_activate` | a panel's tab comes to the front, by pointer, keyboard, drop, or `active_panel` |
-| `on_panel_close` | a closable panel's close affordance is used; remove it from `panels` to complete the close |
+| `on_panel_close` | a close is requested; remove it from `panels` to complete closing |
 | `on_resize` | panel geometry settled, for content that measures its container |
 | `on_tab_menu` | a context-menu gesture on a tab, with panel, tile, and pointer position |
 
@@ -287,5 +335,9 @@ newer than the one dx pins and crashes on the debug info dx keeps by default:
 - Floating panels and maximize-a-group
 - Tab overflow menus for very crowded groups
 - Optional tab reordering within a group
-- Replaceable chrome icons and a per-group toolbar slot
-- Preserving panel state across structural docks (see "Panel state")
+- Replaceable chrome icons
+
+Keyboard focus bridges the stable host layer: Tab from a group's tablist
+focuses its active tabpanel; Shift+Tab on the tabpanel itself returns to its tab.
+Descendant controls retain their own keyboard behavior. Sequential traversal
+out of panel content still follows host DOM order rather than visual group order.

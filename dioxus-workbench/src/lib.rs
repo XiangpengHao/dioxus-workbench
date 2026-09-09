@@ -61,17 +61,16 @@
 //!
 //! ## Panel state
 //!
-//! Panel content stays mounted while tabs switch within a group, so scroll
-//! positions, form values, and internal signals survive activation. A
-//! structural move — docking a panel into another group, an edge split
-//! replacing a tile — rebuilds that region of the element tree and remounts
-//! the panels involved. State that must survive docking belongs outside the
-//! panel: a signal owned by the application, a context, or a store the
-//! panel's content reads.
+//! Panel content stays mounted across activation, docking, and splitting.
+//! Stable hosts follow the recursive layout's measured content slots without
+//! reparenting application DOM. Removing a panel unmounts its content.
+//! [`PanelContext`] exposes reactive visibility and content dimensions.
+//! Group toolbar content belongs to chrome and can remount during docking.
 
 mod dom;
 mod icons;
 mod model;
+mod panel_host;
 mod shell;
 mod strings;
 mod style;
@@ -79,22 +78,24 @@ mod workspace;
 
 pub use dom::focus_after_render;
 pub use model::{
-    DockZone, LayoutError, LayoutNode, PanelId, PanelLayout, PanelPlacement, SplitAxis, SplitId,
-    Tile, TileId,
+    DockZone, LayoutError, LayoutNode, PanelCloseOutcome, PanelId, PanelLayout, PanelPlacement,
+    SplitAxis, SplitId, Tile, TileId,
 };
+pub use panel_host::{PanelContext, PanelGeometry};
 pub use shell::{
     ActivityButton, ActivityRail, StatusBar, StatusDot, StatusItem, StatusMessage, StatusTone,
     Workbench,
 };
 pub use strings::WorkbenchStrings;
 pub use style::STYLE as STYLESHEET;
-pub use workspace::{Panel, PanelWorkspace, TabMenuRequest};
+pub use workspace::{GroupContext, Panel, PanelWorkspace, TabMenuRequest};
 
 /// Everything you typically need.
 pub mod prelude {
     pub use crate::{
-        ActivityButton, ActivityRail, DockZone, LayoutError, LayoutNode, Panel, PanelId,
-        PanelLayout, PanelPlacement, PanelWorkspace, SplitAxis, StatusBar, StatusDot, StatusItem,
-        StatusMessage, StatusTone, TabMenuRequest, TileId, Workbench, WorkbenchStrings,
+        ActivityButton, ActivityRail, DockZone, GroupContext, LayoutError, LayoutNode, Panel,
+        PanelContext, PanelGeometry, PanelId, PanelLayout, PanelPlacement, PanelWorkspace,
+        SplitAxis, StatusBar, StatusDot, StatusItem, StatusMessage, StatusTone, TabMenuRequest,
+        TileId, Workbench, WorkbenchStrings,
     };
 }
