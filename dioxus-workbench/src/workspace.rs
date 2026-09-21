@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use dioxus::html::geometry::WheelDelta;
@@ -158,7 +158,6 @@ struct WorkspaceShared {
     dragging: Signal<Option<PanelId>>,
     drop_preview: Signal<Option<DropPreview>>,
     resizing: Signal<Option<ResizeDrag>>,
-    split_mounts: Signal<HashMap<SplitId, Rc<MountedData>>>,
     on_layout_change: EventHandler<PanelLayout>,
     on_panel_activate: EventHandler<PanelId>,
     on_panel_close: EventHandler<PanelId>,
@@ -327,7 +326,6 @@ pub fn PanelWorkspace(
     let mut drop_preview = use_signal(|| None::<DropPreview>);
     let mut resizing = use_signal(|| None::<ResizeDrag>);
     let mut pending_closes = use_signal(Vec::<PanelId>::new);
-    let split_mounts = use_signal(HashMap::<SplitId, Rc<MountedData>>::new);
     let resolved_reset = reset_layout.unwrap_or_else(|| resolved_initial.clone());
     let resolved_strings = strings.unwrap_or_default();
     let placements_mirror = use_signal({
@@ -353,7 +351,6 @@ pub fn PanelWorkspace(
         dragging,
         drop_preview,
         resizing,
-        split_mounts,
         on_layout_change,
         on_panel_activate,
         on_panel_close,
@@ -610,17 +607,19 @@ fn SplitView(
     } else {
         "wb-splitter"
     };
-    let mut split_mounts = shared.split_mounts;
-    let mounted_split = id.clone();
     let pointer_split = id.clone();
     let keyboard_split = id.clone();
     let reset_split = id.clone();
+    // SplitView instances are reused positionally when docking rewrites the
+    // tree, so a component can receive a new SplitId without remounting. Keep
+    // its DOM handle with the component instead of indexing it by a stale id.
+    let mut split_mount = use_signal(|| None::<Rc<MountedData>>);
 
     rsx! {
         div {
             class: "{split_class}",
             onmounted: move |event| {
-                split_mounts.write().insert(mounted_split.clone(), event.data());
+                split_mount.set(Some(event.data()));
             },
             div {
                 id: "{first_child_dom}",
@@ -643,7 +642,7 @@ fn SplitView(
                     let splitter_dom_id = splitter_dom_id.clone();
                     let first_child_dom = first_child_dom.clone();
                     move |event: PointerEvent| {
-                        let Some(mount) = shared.split_mounts.peek().get(&pointer_split).cloned() else {
+                        let Some(mount) = split_mount.peek().clone() else {
                             return;
                         };
                         event.prevent_default();
@@ -1080,11 +1079,6 @@ fn mutate_layout(shared: WorkspaceShared, mutation: impl FnOnce(&mut PanelLayout
     if !mutation(&mut next) {
         return false;
     }
-    // Structural mutations can drop splits; release their mount handles so
-    // the map does not grow for the session's lifetime.
-    let live = next.split_ids().into_iter().collect::<HashSet<_>>();
-    let mut split_mounts = shared.split_mounts;
-    split_mounts.write().retain(|split, _| live.contains(split));
     layout_signal.set(next.clone());
     shared.on_layout_change.call(next);
     shared.on_resize.call(());
@@ -1181,6 +1175,7 @@ mod tests {
     use super::*;
     use dioxus::dioxus_core::{AttributeValue, Mutation};
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
 
     #[derive(Clone)]
     struct ClosingHarness {
@@ -1346,6 +1341,76 @@ mod tests {
         dom.render_immediate_to_vec();
         assert_eq!(fixture.editor.mounts.get(), 2);
         assert_eq!(&*fixture.editor.draft.borrow().unwrap().peek(), "original");
+    }
+
+    #[derive(Clone)]
+    struct SplitIdentityHarness {
+        layout: Rc<RefCell<Option<Signal<PanelLayout>>>>,
+    }
+
+    impl SplitIdentityHarness {
+        fn render(self) -> Element {
+            let layout = use_signal(|| {
+                PanelLayout::new(LayoutNode::split(
+                    "original-split",
+                    SplitAxis::Horizontal,
+                    0.5,
+                    LayoutNode::tile("first", ["first"]),
+                    LayoutNode::tile("second", ["second"]),
+                ))
+            });
+            *self.layout.borrow_mut() = Some(layout);
+            rsx! { PanelWorkspace {
+                layout,
+                panels: vec![
+                    Panel::new("first", "First", "first", VNode::empty()),
+                    Panel::new("second", "Second", "second", VNode::empty()),
+                ],
+            } }
+        }
+    }
+
+    #[test]
+    fn replacing_split_identity_reuses_its_pointer_target() {
+        let fixture = SplitIdentityHarness {
+            layout: Rc::new(RefCell::new(None)),
+        };
+        let mut dom = VirtualDom::new_with_props(SplitIdentityHarness::render, fixture.clone());
+        dom.rebuild_in_place();
+        let mut layout = fixture.layout.borrow().unwrap();
+
+        dom.in_runtime(|| {
+            layout.set(PanelLayout::new(LayoutNode::split(
+                "replacement-split",
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::tile("first", ["first"]),
+                LayoutNode::tile("second", ["second"]),
+            )));
+        });
+        let mutations = dom.render_immediate_to_vec();
+        assert!(
+            mutations
+                .edits
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    Mutation::SetAttribute {
+                        name: "id",
+                        value: AttributeValue::Text(value),
+                        ..
+                    } => Some(value.as_str()),
+                    _ => None,
+                })
+                .any(|id| id.ends_with("splitter-replacement-split")),
+            "the reused pointer target must receive the replacement split id"
+        );
+        assert!(
+            !mutations
+                .edits
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::ReplaceWith { .. })),
+            "split chrome is reused, so its mounted handle must be component-local"
+        );
     }
 
     struct WorkspacePair;
