@@ -16,6 +16,8 @@ layout, plus a settings screen. Run it with `cd demo && dx serve`.*
 ## Features
 
 - **Tabbed panel groups** — click a tab to activate, drag it to rearrange.
+  A group holding one panel draws no strip: its tab becomes a grabber at the
+  top centre of the panel, shown while the pointer is over the panel.
 - **Drag-to-dock** — drop on a group's center to attach a tab, on an edge to
   split, with live drop previews.
 - **Resizable splits** — drag, arrow-key (Shift for bigger steps), or
@@ -213,6 +215,7 @@ close control. Closing remains an application decision.
 `group_toolbar` accepts a callback from `GroupContext` to `Element`. The context
 exposes `tile()` and `active_panel()`. It is rendered beside the native tab strip;
 workbench owns its sizing, overflow, and placement when groups are docked.
+With a toolbar, every group keeps its strip, including a group of one.
 Return an empty element for groups without actions. Toolbar content belongs to
 the group chrome and may remount during docking; keep durable state in the panel
 or application, not inside a toolbar control.

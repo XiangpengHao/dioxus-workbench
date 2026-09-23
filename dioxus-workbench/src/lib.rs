@@ -55,6 +55,8 @@
 //! - drag a tab to a tile center to attach it as a tab;
 //! - drag to an edge to create a split;
 //! - use the tab-bar actions to split right or down;
+//! - a group of one panel draws no tab bar: its tab becomes a grabber at the
+//!   top centre of the panel, shown while the pointer is over the panel;
 //! - use `Alt+Shift+Arrow` to split from the keyboard;
 //! - use `Alt+Shift+PageUp/PageDown` to move across tile groups;
 //! - drag or arrow-key a separator to resize it; double-click resets it.

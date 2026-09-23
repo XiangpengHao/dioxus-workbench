@@ -47,14 +47,37 @@ impl PanelContext {
     }
 }
 
+/// Where a panel's content currently shows: its tile, whether it is that
+/// tile's front panel, and whether the tile draws its tab as a grabber.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HostPlacement {
+    tile: Option<TileId>,
+    active: bool,
+    grabber: bool,
+}
+
+impl HostPlacement {
+    pub(crate) fn new(tile: Option<TileId>, active: bool, grabber: bool) -> Self {
+        Self {
+            tile,
+            active,
+            grabber,
+        }
+    }
+}
+
 #[component]
 pub(crate) fn PanelHost(
     panel: Panel,
-    tile: Option<TileId>,
-    active: bool,
+    placement: HostPlacement,
     on_close: EventHandler<()>,
     layout_identity: Vec<(crate::SplitId, bool)>,
 ) -> Element {
+    let HostPlacement {
+        tile,
+        active,
+        grabber,
+    } = placement;
     let ids = use_context::<WorkspaceDomIds>();
     let mut geometry = use_signal(PanelGeometry::default);
     use_context_provider(|| PanelContext {
@@ -120,6 +143,11 @@ pub(crate) fn PanelHost(
             "aria-labelledby": label_dom,
             onmounted: move |_| crate::dom::bridge_panel_tab(&keyboard_host, &keyboard_tab),
             {panel.content}
+            // The pointer over a panel is over this host, not its tile, so
+            // the host shows where the tile's grabber waits.
+            if grabber {
+                span { class: "wb-grabber-hint", "aria-hidden": "true" }
+            }
         }
     }
 }

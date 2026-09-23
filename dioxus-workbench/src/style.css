@@ -237,7 +237,7 @@
   background: var(--wb-surface);
 }
 
-.wb-tile-enter > .wb-tab-bar {
+.wb-tile-enter:not(.wb-tile-lone) > .wb-tab-bar {
   animation: wb-tile-enter 140ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
@@ -484,6 +484,108 @@
   width: 16px;
   height: 16px;
   stroke-width: 1.15;
+}
+
+/* Lone panels -------------------------------------------------------------
+   A tile holding one panel has nothing to choose between, so it draws no
+   strip and gives its content the whole tile. Its tab becomes a grabber at
+   the top centre, the one spot on a panel's top edge that content leaves
+   free — a handle in the manner of an iOS sheet, which says "drag me"
+   without naming anything; the content names itself. The panel shows the
+   grabber while the pointer is over it (the host draws that hint: the
+   pointer is over the host, not the tile), and the grabber darkens under
+   the pointer. It is the tab: drag it to dock, right-click for the menu,
+   Delete to close, Alt+Shift+Arrow to split. */
+.wb-tile-lone > .wb-tab-bar {
+  position: absolute;
+  /* Above the tile's own drop overlay, and never switched off: a browser
+     abandons a drag whose source is no longer under the pointer that
+     started it. */
+  z-index: 31;
+  top: 0;
+  left: 50%;
+  width: 44px;
+  height: 14px;
+  min-height: 0;
+  flex: none;
+  overflow: visible;
+  border: none;
+  background: transparent;
+  transform: translateX(-50%);
+}
+
+.wb-tile-lone > .wb-tab-bar :is(.wb-tabs, .wb-tab-item, .wb-tab) {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  max-width: none;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+}
+
+.wb-tile-lone > .wb-tab-bar .wb-tab-item::before,
+.wb-tile-lone > .wb-tab-bar :is(.wb-tab-icon, .wb-tab-accessory) {
+  display: none;
+}
+
+/* The title stays for assistive technology only. */
+.wb-tile-lone > .wb-tab-bar .wb-tab-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.wb-tile-lone > .wb-tab-bar .wb-tab::after,
+.wb-panel-content > .wb-grabber-hint {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 50%;
+  width: 28px;
+  height: 4px;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 999px;
+  background: var(--wb-ink-faint);
+  /* A pale rim keeps the grabber legible on dark content such as video. */
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--wb-surface) 55%, transparent);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.wb-tile-lone > .wb-tab-bar .wb-tab::after {
+  opacity: 0;
+  transition: opacity 120ms ease-out, width 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 120ms ease-out;
+}
+
+.wb-tile-lone > .wb-tab-bar .wb-tab:is(:hover, :active, :focus-visible)::after {
+  width: 36px;
+  background: var(--wb-ink);
+  opacity: 1;
+}
+
+.wb-panel-content > .wb-grabber-hint {
+  z-index: 20;
+  opacity: 0;
+  transition: opacity 160ms ease-out;
+}
+
+.wb-panel-host:hover > .wb-grabber-hint {
+  opacity: 0.6;
+}
+
+.wb-workspace[data-dragging="true"] .wb-grabber-hint {
+  opacity: 0;
+}
+
+.wb-tile-lone > .wb-dock-overlay {
+  inset: 0;
 }
 
 .wb-panel-frame,
@@ -908,6 +1010,10 @@ button.wb-status-item:focus-visible {
   .wb-tile-enter,
   .wb-drop-preview {
     animation: none;
+  }
+
+  .wb-tile-lone > .wb-tab-bar .wb-tab::after {
+    transition-property: opacity, background-color;
   }
 }
 

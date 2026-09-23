@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use crate::dom;
 use crate::icons::{CloseIcon, DockCompassIcon, SplitDownIcon, SplitRightIcon};
 use crate::model::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO};
-use crate::panel_host::PanelHost;
+use crate::panel_host::{HostPlacement, PanelHost};
 use crate::strings::WorkbenchStrings;
 use crate::style::{use_style_owner, WorkbenchStyle};
 use crate::{
@@ -167,6 +167,14 @@ struct WorkspaceShared {
 }
 
 impl WorkspaceShared {
+    /// Whether a group draws its tab as a grabber instead of a strip. A
+    /// group of one panel has nothing to choose between, so a strip there
+    /// would only label it; a group toolbar is application content that
+    /// needs the strip it sits in.
+    fn draws_grabber(self, panels: &[PanelId]) -> bool {
+        panels.len() == 1 && self.group_toolbar.is_none()
+    }
+
     fn request_close(self, panel: PanelId) {
         let mut pending = self.pending_closes;
         if !pending.peek().contains(&panel) {
@@ -301,7 +309,9 @@ pub fn PanelWorkspace(
     /// position. Absent, tabs keep the native menu.
     #[props(default)]
     on_tab_menu: Option<EventHandler<TabMenuRequest>>,
-    /// Content beside each group's tabs. The workspace owns sizing and placement.
+    /// Content beside each group's tabs. The workspace owns sizing and
+    /// placement. With a toolbar, a group of one keeps its tab strip instead
+    /// of turning its tab into a grabber.
     #[props(default)]
     group_toolbar: Option<Callback<GroupContext, Element>>,
     /// Overrides for the chrome's own text — see [`WorkbenchStrings`].
@@ -466,10 +476,9 @@ pub fn PanelWorkspace(
         .cloned()
         .map(|panel| {
             let tile = display.tile_for_panel(&panel.id);
-            let active = tile
-                .as_ref()
-                .and_then(|id| display.tile(id))
-                .is_some_and(|tile| tile.active.as_ref() == Some(&panel.id));
+            let shown_in = tile.as_ref().and_then(|id| display.tile(id));
+            let active = shown_in.is_some_and(|tile| tile.active.as_ref() == Some(&panel.id));
+            let grabber = shown_in.is_some_and(|tile| shared.draws_grabber(&tile.panels));
             let layout_identity = tile
                 .as_ref()
                 .and_then(|id| display.root.tile_path(id))
@@ -477,7 +486,8 @@ pub fn PanelWorkspace(
             let close_id = panel.id.clone();
             let closable = panel.closable;
             // Keep the key on each sibling VNode, not inside an unkeyed wrapper.
-            rsx! { PanelHost { key: "{panel.id}", panel, tile, active,
+            rsx! { PanelHost { key: "{panel.id}", panel,
+                placement: HostPlacement::new(tile, active, grabber),
                 on_close: move |_| if closable { shared.request_close(close_id.clone()); },
                 layout_identity,
             } }
@@ -726,7 +736,11 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
     }));
     let dragging_active = use_memo(move || shared.dragging.read().is_some());
     let strings = shared.strings.read().clone();
+    let lone = shared.draws_grabber(&tile.panels);
     let mut tile_classes = vec!["wb-tile"];
+    if lone {
+        tile_classes.push("wb-tile-lone");
+    }
     if drop_active() {
         tile_classes.push("wb-tile-drop-active");
     }
@@ -792,43 +806,47 @@ fn TileView(tile: Tile, panels: Vec<Panel>, display_tile_count: usize) -> Elemen
                         span { class: "wb-empty-label", "{strings.empty_group_label}" }
                     }
                 }
-                div { class: "wb-tile-actions",
-                    button {
-                        r#type: "button",
-                        class: "wb-tile-action wb-icon-btn wb-hover-action",
-                        "aria-label": "{strings.split_right_label}",
-                        title: "{strings.split_right_hint}",
-                        onclick: move |_| {
-                            mutate_layout(shared, |layout| {
-                                layout.split_active(&right_tile, DockZone::Right)
-                            });
-                        },
-                        SplitRightIcon {}
-                    }
-                    button {
-                        r#type: "button",
-                        class: "wb-tile-action wb-icon-btn wb-hover-action",
-                        "aria-label": "{strings.split_down_label}",
-                        title: "{strings.split_down_hint}",
-                        onclick: move |_| {
-                            mutate_layout(shared, |layout| {
-                                layout.split_active(&down_tile, DockZone::Bottom)
-                            });
-                        },
-                        SplitDownIcon {}
-                    }
-                    if tile.panels.is_empty() && display_tile_count > 1 {
+                // Splitting a lone panel would only split off an empty tile;
+                // dragging its grabber to an edge, or `Alt+Shift+Arrow`, splits.
+                if !lone {
+                    div { class: "wb-tile-actions",
                         button {
                             r#type: "button",
                             class: "wb-tile-action wb-icon-btn wb-hover-action",
-                            "aria-label": "{strings.close_empty_label}",
-                            title: "{strings.close_empty_hint}",
+                            "aria-label": "{strings.split_right_label}",
+                            title: "{strings.split_right_hint}",
                             onclick: move |_| {
                                 mutate_layout(shared, |layout| {
-                                    layout.remove_empty_tile(&close_tile)
+                                    layout.split_active(&right_tile, DockZone::Right)
                                 });
                             },
-                            CloseIcon {}
+                            SplitRightIcon {}
+                        }
+                        button {
+                            r#type: "button",
+                            class: "wb-tile-action wb-icon-btn wb-hover-action",
+                            "aria-label": "{strings.split_down_label}",
+                            title: "{strings.split_down_hint}",
+                            onclick: move |_| {
+                                mutate_layout(shared, |layout| {
+                                    layout.split_active(&down_tile, DockZone::Bottom)
+                                });
+                            },
+                            SplitDownIcon {}
+                        }
+                        if tile.panels.is_empty() && display_tile_count > 1 {
+                            button {
+                                r#type: "button",
+                                class: "wb-tile-action wb-icon-btn wb-hover-action",
+                                "aria-label": "{strings.close_empty_label}",
+                                title: "{strings.close_empty_hint}",
+                                onclick: move |_| {
+                                    mutate_layout(shared, |layout| {
+                                        layout.remove_empty_tile(&close_tile)
+                                    });
+                                },
+                                CloseIcon {}
+                            }
                         }
                     }
                 }
@@ -875,6 +893,11 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
     } else {
         "wb-tab-item"
     };
+    // A lone panel's tab is only a grabber: it names nothing on screen, so
+    // it pops up no tooltip and offers no close control. Its title stays for
+    // assistive technology, and Delete still closes a closable panel.
+    let lone = shared.draws_grabber(&tab_order);
+    let tooltip = (!lone).then(|| format!("{title}. {}", strings.tab_hint));
     let mut drag_signal = shared.dragging;
     let mut drag_preview_signal = shared.drop_preview;
     let drag_tile = tile_id.clone();
@@ -903,7 +926,7 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
                 tabindex: "{tab_index}",
                 "aria-selected": is_active,
                 "aria-controls": "{controlled_panel_id}",
-                title: "{title}. {strings.tab_hint}",
+                title: tooltip,
                 onclick: move |_| {
                     mutate_layout(shared, |layout| layout.activate(&activate_id));
                     shared.on_panel_activate.call(activate_id.clone());
@@ -983,7 +1006,7 @@ fn TabItem(panel: Panel, tile_id: TileId, is_active: bool, tab_order: Vec<PanelI
                     span { class: "wb-tab-accessory", {accessory} }
                 }
             }
-            if panel.closable {
+            if panel.closable && !lone {
                 button {
                     r#type: "button",
                     class: "wb-tab-close wb-icon-btn wb-hover-action",
@@ -1410,6 +1433,69 @@ mod tests {
                 .iter()
                 .any(|mutation| matches!(mutation, Mutation::ReplaceWith { .. })),
             "split chrome is reused, so its mounted handle must be component-local"
+        );
+    }
+
+    struct LoneAndGroup;
+    impl LoneAndGroup {
+        fn render() -> Element {
+            rsx! {
+                PanelWorkspace {
+                    panels: vec![
+                        Panel::new("scene", "Scene", "primary", rsx! { "Scene content" }),
+                        Panel::new("details", "Details", "secondary", rsx! { "Details content" }),
+                        Panel::new("notes", "Notes", "secondary", rsx! { "Notes content" }),
+                    ],
+                    initial_layout: PanelLayout::new(LayoutNode::split(
+                        "columns", SplitAxis::Horizontal, 0.5,
+                        LayoutNode::tile("primary", ["scene".to_owned()]),
+                        LayoutNode::tile("secondary", ["details".to_owned(), "notes".to_owned()]),
+                    )),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_group_of_one_turns_its_tab_into_a_grabber_without_chrome() {
+        let mut dom = VirtualDom::new(LoneAndGroup::render);
+        let mutations = dom.rebuild_to_vec();
+        let attributes = mutations
+            .edits
+            .into_iter()
+            .filter_map(|edit| match edit {
+                Mutation::SetAttribute {
+                    name,
+                    value: AttributeValue::Text(value),
+                    ..
+                } => Some((name, value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut tiles = attributes
+            .iter()
+            .filter(|(name, value)| *name == "class" && value.starts_with("wb-tile"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        tiles.sort_unstable();
+        assert_eq!(tiles, ["wb-tile", "wb-tile wb-tile-lone"]);
+        let strings = WorkbenchStrings::default();
+        assert_eq!(
+            attributes
+                .iter()
+                .filter(|(name, value)| *name == "title" && value.ends_with(&strings.tab_hint))
+                .count(),
+            2,
+            "only the strip's tabs pop up their title"
+        );
+        let split_right = strings.split_right_label;
+        assert_eq!(
+            attributes
+                .iter()
+                .filter(|(name, value)| *name == "aria-label" && *value == split_right)
+                .count(),
+            1,
+            "only the group of two offers to split"
         );
     }
 
