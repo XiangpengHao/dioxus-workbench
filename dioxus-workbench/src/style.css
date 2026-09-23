@@ -401,7 +401,11 @@
   background: var(--wb-accent);
 }
 
+/* The label takes whatever the tab has left, so its end is always the tab's
+   trailing edge — where a close control arrives. */
 .wb-tab-label {
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -423,11 +427,26 @@
   height: 0.875rem;
 }
 
+/* The close control floats over a tab's trailing edge instead of reserving
+   its width in every tab, so a crowded strip spends that width on titles. It
+   arrives with the pointer or focus, as before; the title fades out beneath
+   it, and a trailing accessory steps aside for it. */
 .wb-tab-close {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  right: 4px;
   min-width: 24px;
   min-height: 24px;
-  flex: 0 0 24px;
-  align-self: center;
+  transform: translateY(-50%);
+}
+
+.wb-tab-item:is(:hover, :focus-within):has(> .wb-tab-close) .wb-tab-label {
+  mask-image: linear-gradient(to left, transparent 20px, #000 32px);
+}
+
+.wb-tab-item:is(:hover, :focus-within):has(> .wb-tab-close) .wb-tab-accessory {
+  visibility: hidden;
 }
 
 .wb-tab-close .wb-icon {
